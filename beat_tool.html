@@ -124,6 +124,7 @@ const WHAT_REMOTE = {
   engine: "The studio's own engine computing on the rented NVIDIA card: its backend is set to vulkan (the studio ships its CUDA song engine for Windows only, so there it computes through Vulkan on the same card; this step sets it when it is not, and restarts the engine), and its own log must name the card. Score, stems and MIDI use CUDA. No song is made.",
 };
 let S = null;
+let staleBackend = false;
 let built = {};
 const sigs = {};
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -361,12 +362,15 @@ const R = {
       const b = gated(button("Download what is missing", () => act("parts"))); b.id = "parts-go"; c.append(b);
     });
     const left = (data.parts || []).filter(p => !p.ready && p.can !== false).reduce((n, p) => n + (p.missing_bytes || 0), 0);
+    // what Open waits for: an optional part missing does not keep it back
     $("#parts-go").textContent = data.parts ? (left ? "Download what is missing (" + size(left) + ")" : "Check the parts") : "Download what is missing";
     if (changed("parts", data)) {
       $(".extra", el).innerHTML = data.parts ? '<div class="list">' + data.parts.map(p =>
         '<div class="option' + (p.ready ? " ready" : "") + '"><div><b>' + esc(p.label) + "</b> · " +
         (p.ready ? "ready" : p.can === false ? "not on this card" + (p.why ? ": " + esc(p.why) : "") : size(p.missing_bytes) + " to download") +
-        "<small>" + esc(p.detail) + "</small></div></div>").join("") + "</div>" : "";
+        (p.optional ? " · optional: Open YuE2 Studio does not wait for it" : "") +
+        "<small>" + esc(p.detail) + "</small>" + (p.skipped && !p.ready ? "<small>Did not complete: " + esc(p.skipped) + "</small>" : "") +
+        "</div></div>").join("") + "</div>" : "";
     }
   },
   open() { once("open", c => c.append(gated(button("Open YuE2 Studio ↗", openStudio)))); },
@@ -399,7 +403,17 @@ function render() {
 async function refresh() {
   try {
     const r = await fetch("/api/state", { cache: "no-store" });
-    S = await r.json();
+    const state = await r.json();
+    // The page is read from disk at every load, the backend only when it starts: a backend started before an update
+    // answers in its old shape.
+    if (!Array.isArray(state.order)) {
+      staleBackend = true;
+      message("This page is newer than the Beat Tool backend answering it, which was started before the update. " +
+        "Close the Beat Tool window (the black one) and run “RUN ME - Beat Tool.cmd” again; this page picks it up by itself.");
+      return;
+    }
+    if (staleBackend) { staleBackend = false; message(""); }
+    S = state;
     if (startClick && startClick.gone) startClick = null;     // the backend answers again: its own state shows
     render();
   } catch (e) { message("The Beat Tool backend does not answer: " + e.message + ". Is its window still open?"); }

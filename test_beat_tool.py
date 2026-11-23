@@ -603,6 +603,41 @@ class OffersTest(unittest.TestCase):
         self.assertEqual(data["offers_rule"], {"gpus": "RTX 4090 or RTX 5090", "reliability": 99.5, "mbps": 500})
         self.assertEqual(len(data["offers"]), 1)
 
+    def test_a_machine_rented_by_someone_else_first_rents_nothing_and_the_list_is_searched_again(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        searched = []
+
+        class FakeVast:
+            def __init__(self, key, sleep=None):
+                pass
+
+            def offers(self):
+                searched.append(1)
+                return [beat_remote.offer_view(offer(id=9))], 1
+
+            def rent(self, offer_id, public):
+                raise beat_remote.VastError(
+                    f'vast.ai answered HTTP 400 to PUT /asks/{offer_id}/: {{"success":false,"error":"invalid_args",'
+                    f'"msg":"error 404/3603: no_such_ask  Instance type by id {offer_id} is not available."}}')
+
+            def instance(self, _id):
+                return None
+        app = App(folder=Path(temp.name), studio=FakeStudio(), vast_api=FakeVast)
+        app.keys.load = lambda: "key"
+        (app.vast_dir).mkdir(parents=True, exist_ok=True)
+        for name in ("beat_tool_ed25519", "beat_tool_ed25519.pub"):       # this tool's SSH key, made before
+            (app.vast_dir / name).write_text("ssh-ed25519 AAAA beat-tool\n", encoding="ascii")
+        app.steps["where"]["data"]["offers"] = [beat_remote.offer_view(offer(id=61040417))]
+        app.act("vast_rent", {"offer": "61040417"}).join(10)
+        where = app.steps["where"]
+        self.assertIn("was rented by someone else just before your click", where["error"])
+        self.assertIn("Nothing was rented and nothing is billed. The list has been searched again", where["error"])
+        self.assertEqual([entry["id"] for entry in where["data"]["offers"]], [9])
+        self.assertEqual(searched, [1])
+        self.assertFalse((app.vast_dir / "instance.json").exists())
+        self.assertEqual((app.mode, where["state"]), ("pc", "ok"))
+
 
 # ------------------------------------------------------------ the rented machine's GPU step: disk for everything
 
@@ -751,8 +786,35 @@ class CudaTest(unittest.TestCase):
                                "@@vulkan-end 0"])
         self.assertEqual(cuda["state"], "failed")
         self.assertIn("Vulkan finds no NVIDIA card on the rented machine, only llvmpipe", cuda["error"])
-        self.assertIn("libGLX_nvidia: not in the image", cuda["error"])
-        self.assertIn("Stop renting this machine", cuda["error"])
+        self.assertIn("no NVIDIA Vulkan driver (libGLX_nvidia is not in its image). Stop renting it", cuda["error"])
+
+    def test_a_driver_that_lacks_libegl_is_not_the_machines_fault(self):
+        # driver 615 opens libEGL.so.1 before it starts Vulkan and refuses without it (rented RTX 4090, 23 Nov 2026)
+        cuda = self.on_rented(["@@icd /etc/vulkan/icd.d/nvidia_icd.json", "@@glx 1", "@@glxmissing ", "@@egl 0",
+                               "@@json " + json.dumps(PROBE), "@@vulkan-begin",
+                               "ERROR: [Loader Message] Code 0 : loader_scanned_icd_add: Could not get 'vkCreateInstance' "
+                               "via 'vk_icdGetInstanceProcAddr' for ICD libGLX_nvidia.so.0",
+                               "ERROR at ./vulkaninfo/vulkaninfo.h:649:vkCreateInstance failed with ERROR_INCOMPATIBLE_DRIVER",
+                               "@@vulkan-end 1"])
+        self.assertEqual(cuda["state"], "failed")
+        self.assertIn("what it needs is missing: libEGL.so.1", cuda["error"])
+        self.assertIn("The machine itself is not at fault", cuda["error"])
+        self.assertNotIn("Stop renting", cuda["error"])
+
+    def test_one_card_listed_twice_is_refused(self):
+        cuda = self.on_rented(["@@icd /etc/vulkan/icd.d/nvidia_icd.json", "@@glx 1", "@@json " + json.dumps(PROBE),
+                               "@@vulkan-begin", *VULKAN_CARD, *[line.replace("GPU0", "GPU1") for line in VULKAN_CARD],
+                               "@@vulkan-end 0"])
+        self.assertEqual(cuda["state"], "failed")
+        self.assertIn("lists the one NVIDIA card more than once", cuda["error"])
+
+    def test_the_machine_gets_what_the_cards_vulkan_driver_needs_before_the_test(self):
+        script = beat_remote.compute_script()
+        for package in ("libxext6", "libx11-6", "libglvnd0", "libegl1", "vulkan-tools", "python3"):
+            self.assertIn(package, script)
+        self.assertNotIn("if ! ls /usr/share/vulkan/icd.d/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json", script)
+        self.assertNotIn("if ! ls /usr/share/vulkan/icd.d/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json",
+                         beat_remote.studio_script("u", "n", 1, "s", "/root/beat_tool/f", "m"))
 
     def test_rented_machine_whose_cuda_fails(self):
         cuda = self.on_rented(["@@json " + json.dumps({"error": "cuInit (the driver starting CUDA) failed: CUDA error 999"})])
@@ -874,13 +936,22 @@ class PartsStudio:
     """The studio's downloadable parts: each one asked for downloads over two polls, then counts ready; a part in
     stall never moves."""
 
-    def __init__(self, ready=(), stall=(), card_trains=True, trainer_installed=True):
+    def __init__(self, ready=(), stall=(), card_trains=True, trainer_installed=True, fails=(), stale=()):
         self.ready, self.stall, self.asked, self.polls = set(ready), set(stall), [], {}
         self.card_trains, self.trainer_installed, self.last = card_trains, trainer_installed, None
+        self.fails, self.stale = set(fails), set(stale)      # failing every try; showing an old failure at first
 
     def progress(self, part):
+        failed = {"asset_id": "onnxruntime", "downloaded_bytes": 0, "total_bytes": 11306877, "done": True,
+                  "error": "ONNX Runtime: https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/"
+                           "onnxruntime-linux-x64-1.30.0.tgz answered 404 Not Found"}
+        if part in self.fails and part not in self.ready:
+            return failed
         if part in self.ready or part not in self.asked or part in self.stall:
             return None
+        if part in self.stale:
+            self.stale.discard(part)
+            return failed                   # one poll still shows the earlier try's failure
         self.polls[part] = self.polls.get(part, 0) + 1
         if self.polls[part] >= 2:
             self.ready.add(part)
@@ -952,6 +1023,31 @@ class PartsTest(unittest.TestCase):
         self.assertEqual(parts["state"], "failed")
         self.assertIn("Audio to MIDI (MuScriptor) stopped downloading without being ready", parts["error"])
 
+    def test_the_listening_pack_failing_is_told_and_does_not_block(self):
+        # ONNX Runtime's own release on GitHub answered 404 on 23 Nov 2026: the studio cannot complete this pack
+        studio = PartsStudio(ready={"separator", "training", "midi"}, fails={"listen"})
+        parts = self.click(studio)
+        self.assertEqual(parts["state"], "ok", parts["error"])
+        fact = parts["facts"]["Listening pack (MOSS-Music, tempo)"]
+        self.assertIn("not complete, optional (Open YuE2 Studio does not wait for it)", fact)
+        self.assertIn("onnxruntime-linux-x64-1.30.0.tgz answered 404 Not Found", fact)
+        self.assertIn("Describe by ear may not work", parts["note"])
+        listen = next(entry for entry in parts["data"]["parts"] if entry["id"] == "listen")
+        self.assertTrue(listen["optional"])
+        self.assertIn("404 Not Found", listen["skipped"])
+        self.assertTrue(self.app.snapshot()["can"]["open"])
+
+    def test_a_required_part_failing_still_stops_the_step(self):
+        parts = self.click(PartsStudio(ready={"separator", "listen"}, fails={"training"}))
+        self.assertEqual(parts["state"], "failed")
+        self.assertIn("Training pack (LoRA): the download failed", parts["error"])
+
+    def test_an_earlier_tries_failure_still_shown_is_not_this_tries(self):
+        studio = PartsStudio(ready={"separator", "training", "listen"}, stale={"midi"})
+        parts = self.click(studio)
+        self.assertEqual(parts["state"], "ok", parts["error"])
+        self.assertIn("ready", parts["facts"]["Audio to MIDI (MuScriptor)"])
+
     def test_a_card_that_cannot_train_is_named_and_does_not_block(self):
         studio = PartsStudio(ready={"separator", "midi", "listen"}, card_trains=False)
         parts = self.click(studio)
@@ -1019,10 +1115,15 @@ class OpenTest(unittest.TestCase):
         self.assertFalse(self.app.snapshot()["can"]["open"])
 
     def test_a_part_gone_turns_parts_red(self):
-        self.app.studio = ReadyStudio(ready={"separator", "training", "midi"})
-        with self.assertRaisesRegex(ValueError, r"not ready: Listening pack"):
+        self.app.studio = ReadyStudio(ready={"separator", "training", "listen"})
+        with self.assertRaisesRegex(ValueError, r"not ready: Audio to MIDI"):
             self.app.open_click()
         self.assertEqual(self.app.steps["parts"]["state"], "failed")
+
+    def test_an_incomplete_listening_pack_does_not_keep_the_studio_closed(self):
+        self.app.studio = ReadyStudio(ready={"separator", "training", "midi"})
+        self.assertEqual(self.app.open_click(), "http://127.0.0.1:8791/")
+        self.assertEqual(self.app.steps["open"]["facts"]["Not complete (optional)"], "Listening pack (MOSS-Music, tempo)")
 
     def test_a_studio_gone_turns_start_red(self):
         studio = ReadyStudio()

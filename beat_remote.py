@@ -612,9 +612,12 @@ VULKAN_ICD = '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidi
 def compute_script():
     """The rented machine's CUDA and Vulkan tested before anything of the studio is downloaded: CUDA_PROBE with the
     runtime libraries, and vulkaninfo, since the studio's song engine computes through Vulkan there. Installs what the
-    test needs (python3, vulkan-tools, the Vulkan loader) and, where the NVIDIA runtime mounted the card's Vulkan
-    driver without the file that names it, writes that file. Prints @@ lines, one @@json line from the probe and the
-    vulkaninfo summary between @@vulkan-begin and @@vulkan-end."""
+    test needs (python3, vulkan-tools, the Vulkan loader) and what the card's Vulkan driver (libGLX_nvidia, mounted from
+    the host) needs but the CUDA image lacks: libXext and libX11, which it links, and libEGL, which driver 615 opens
+    before it starts Vulkan and refuses without (both seen on a rented RTX 4090 on 23 Nov 2026; the studio's own
+    packages bring them later, too late for this test). Where the NVIDIA runtime mounted that driver without the file
+    that names it, writes that file. Prints @@ lines, one @@json line from the probe and the vulkaninfo summary between
+    @@vulkan-begin and @@vulkan-end."""
     q = shlex.quote
     return f"""
 set -u
@@ -625,6 +628,10 @@ need=""
 command -v python3 >/dev/null 2>&1 || need="$need python3"
 command -v vulkaninfo >/dev/null 2>&1 || need="$need vulkan-tools"
 have 'libvulkan.so.1' || need="$need libvulkan1"
+have 'libXext.so.6' || need="$need libxext6"
+have 'libX11.so.6' || need="$need libx11-6"
+have 'libGLdispatch.so.0' || need="$need libglvnd0"
+have 'libEGL.so.1' || need="$need libegl1"
 if [ -n "$need" ]; then
   echo "@@ Installing what the test needs:$need…"
   if ! {{ apt-get update -q && apt-get install -y -q --no-install-recommends $need; }} </dev/null > /tmp/beat_tool_test_packages.log 2>&1; then
@@ -633,14 +640,24 @@ if [ -n "$need" ]; then
     exit 0
   fi
 fi
-if ! ls /usr/share/vulkan/icd.d/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json >/dev/null 2>&1 && have 'libGLX_nvidia.so.0'; then
+# only when neither place has it: "ls a b" fails when either is missing, which once wrote a second file beside the
+# driver's own, and Vulkan then listed the one card twice
+if [ ! -e /usr/share/vulkan/icd.d/nvidia_icd.json ] && [ ! -e /etc/vulkan/icd.d/nvidia_icd.json ] && have 'libGLX_nvidia.so.0'; then
   mkdir -p /usr/share/vulkan/icd.d
   printf '%s\\n' {q(VULKAN_ICD)} > /usr/share/vulkan/icd.d/nvidia_icd.json
   echo "@@ Wrote /usr/share/vulkan/icd.d/nvidia_icd.json for the card's Vulkan driver"
 fi
-icd=$(ls /usr/share/vulkan/icd.d/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json 2>/dev/null | head -n1)
+# such a second file, written by Beat Tool beside the driver's own, is taken away again
+if [ -e /etc/vulkan/icd.d/nvidia_icd.json ] && [ "$(cat /usr/share/vulkan/icd.d/nvidia_icd.json 2>/dev/null)" = {q(VULKAN_ICD)} ]; then
+  rm -f /usr/share/vulkan/icd.d/nvidia_icd.json
+  echo "@@ Removed Beat Tool's second Vulkan driver file beside the driver's own"
+fi
+icd=$(ls /etc/vulkan/icd.d/nvidia_icd.json /usr/share/vulkan/icd.d/nvidia_icd.json 2>/dev/null | head -n1)
 echo "@@icd ${{icd:-none}}"
 echo "@@glx $(ldconfig -p | grep -c 'libGLX_nvidia.so.0')"
+glx=$(ldconfig -p | grep 'libGLX_nvidia.so.0' | head -n1 | awk '{{print $NF}}')
+if [ -n "$glx" ]; then echo "@@glxmissing $(ldd "$glx" 2>/dev/null | grep 'not found' | awk '{{print $1}}' | tr '\\n' ' ')"; fi
+echo "@@egl $(ldconfig -p | grep -c 'libEGL.so.1 ')"
 echo "@@ Testing CUDA on the card…"
 python3 - {" ".join(q(name) for name in RUNTIME_LIBRARIES)} <<'BEAT_TOOL_CUDA_PROBE'
 {CUDA_PROBE}
@@ -689,7 +706,7 @@ if ! command -v Xvfb >/dev/null 2>&1 || ! have 'libwebkit2gtk-4.1.so.0' || ! hav
 fi
 # The NVIDIA runtime mounts the card's Vulkan driver (libGLX_nvidia) with the graphics capability; some hosts leave out
 # the file that names it to the Vulkan loader, which is then written here.
-if ! ls /usr/share/vulkan/icd.d/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json >/dev/null 2>&1 && have 'libGLX_nvidia.so.0'; then
+if [ ! -e /usr/share/vulkan/icd.d/nvidia_icd.json ] && [ ! -e /etc/vulkan/icd.d/nvidia_icd.json ] && have 'libGLX_nvidia.so.0'; then
   mkdir -p /usr/share/vulkan/icd.d
   printf '{{"file_format_version":"1.0.0","ICD":{{"library_path":"libGLX_nvidia.so.0","api_version":"1.3"}}}}\\n' > /usr/share/vulkan/icd.d/nvidia_icd.json
   echo "@@ Wrote /usr/share/vulkan/icd.d/nvidia_icd.json for the card's Vulkan driver"

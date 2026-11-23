@@ -107,6 +107,9 @@ ACTIONS = {"where_pc": "where", "vast_key": "where", "vast_forget": "where", "va
 PARTS = ("separator", "training", "midi", "listen")
 PART_LABELS = {"separator": "Stem separator (HT-Demucs)", "training": "Training pack (LoRA)",
                "midi": "Audio to MIDI (MuScriptor)", "listen": "Listening pack (MOSS-Music, tempo)"}
+# Parts Open YuE2 Studio does not wait for: the listening pack only describes LoRA dataset songs by ear, and the
+# ONNX Runtime its tempo model needs comes from github.com/microsoft/onnxruntime, which answered 404 on 23 Nov 2026.
+OPTIONAL_PARTS = ("listen",)
 PART_STALL = 90        # seconds with nothing downloading and the part still missing: the studio stopped without saying
 MIN_FREE_END_GB = 10   # free disk left once everything is downloaded, for your songs, datasets and LoRA runs
 CUT_AT = 60_000       # YuE2 Studio's MCP cuts a longer answer and sends it as plain text (mcp.rs LIMIT at v3.8.2)
@@ -648,10 +651,32 @@ class App:
             raise ValueError("Choose a machine from the list first (Find machines).")
         _key, public = beat_remote.make_ssh_key(self.vast_dir, run=self.run)
         self.note("where", f"Renting offer {offer['id']} ({offer['gpu']}, ${offer['dph']}/h)…")
-        instance_id = vast.rent(offer["id"], public)
+        try:
+            instance_id = vast.rent(offer["id"], public)
+        except VastError as error:
+            if "no_such_ask" not in str(error) and "not available" not in str(error):
+                raise
+            raise ValueError(self.offer_gone(vast, offer)) from None
         record = {"id": instance_id, "offer": offer, "rented": now_text(), "rented_epoch": time.time(), "image": beat_remote.IMAGE}
         write_json(self.vast_dir / "instance.json", record)        # written at once: it can be stopped whatever happens next
         return record, vast
+
+    def offer_gone(self, vast, offer):
+        """An offer rented by someone else between Find machines and the click: nothing was rented. The list is searched
+        again so the next click finds a machine that is there; answers what to tell."""
+        told = (f"{offer['gpu']} at ${_number(offer['dph']):.3f}/h ({offer.get('where') or 'offer ' + str(offer['id'])}) was "
+                "rented by someone else just before your click: vast.ai no longer offers it. Nothing was rented and "
+                "nothing is billed.")
+        try:
+            offers, seen = vast.offers()
+        except VastError:
+            offers = [o for o in self.steps["where"]["data"].get("offers") or [] if str(o["id"]) != str(offer["id"])]
+            seen = self.steps["where"]["data"].get("offers_seen")
+            told += " The list shows the others found before; Find machines searches again."
+        else:
+            told += " The list has been searched again: pick another."
+        self.where_data(offers=offers, offers_seen=seen, offers_at=now_text())
+        return told
 
     def do_vast_connect(self, _body):
         record = self.saved_instance()
@@ -1039,6 +1064,24 @@ class App:
     def here(self):
         return "the rented machine" if self.mode == "vast" else "this PC"
 
+    def vulkan_problem(self, devices, seen, vulkan):
+        """Why Vulkan found no NVIDIA card on the rented machine, told apart: a machine without the card's Vulkan driver
+        is one to stop renting; a driver that is there but cannot start is not the machine's fault."""
+        others = ", ".join(device.get("deviceName", "?") for device in devices)
+        start = ("Vulkan finds no NVIDIA card on the rented machine" + (f", only {others}" if others else "")
+                 + ". The studio's song engine computes through Vulkan there, so it would run on the processor.\n")
+        printed = "\nWhat vulkaninfo printed last:\n" + "\n".join(vulkan[-8:])
+        if seen.get("glx", "0") in ("", "0"):
+            return (start + "The machine has no NVIDIA Vulkan driver (libGLX_nvidia is not in its image). Stop renting it "
+                            "and rent another." + printed)
+        missing = seen.get("glxmissing", "").split() + ([] if seen.get("egl", "1") not in ("", "0") else ["libEGL.so.1"])
+        if missing:
+            return (start + f"The card's Vulkan driver is there, but what it needs is missing: {', '.join(missing)}. Beat "
+                            "Tool installs these; here they did not install. The machine itself is not at fault." + printed)
+        driver = (self.gpu or {}).get("driver", "?")
+        return (start + f"The card's Vulkan driver (NVIDIA {driver}) is there and has what it links, but refuses to start. "
+                        f"Vulkan driver file: {seen.get('icd') or 'none'}." + printed)
+
     def cuda_remote(self):
         """The CUDA test on the rented machine with the CUDA 13 libraries its image carries, then Vulkan: vulkaninfo must
         list the NVIDIA card, not only the processor's software device, or the song engine would compute on the
@@ -1063,7 +1106,7 @@ class App:
                              "CUDA 13 builds. Stop renting it and rent another.")
         seen = {}
         for line in lines:
-            if line.startswith(("@@icd ", "@@glx ")):
+            if line.startswith(("@@icd ", "@@glx ", "@@glxmissing ", "@@egl ")):
                 key, _, value = line[2:].partition(" ")
                 seen[key] = value.strip()
         vulkan, inside_summary = [], False
@@ -1078,12 +1121,10 @@ class App:
         cards = [device for device in devices if device.get("vendorID", "").lower() == "0x10de"
                  or "NVIDIA" in device.get("deviceName", "").upper()]
         if not cards:
-            others = ", ".join(device.get("deviceName", "?") for device in devices)
-            glx = "found" if seen.get("glx", "0") not in ("", "0") else "not in the image"
-            raise ValueError("Vulkan finds no NVIDIA card on the rented machine" + (f", only {others}" if others else "")
-                             + ". The studio's song engine computes through Vulkan there, so it would run on the processor. "
-                             f"Vulkan driver file: {seen.get('icd') or 'none'}; libGLX_nvidia: {glx}. Stop renting this "
-                             "machine and rent another. What vulkaninfo printed last:\n" + "\n".join(vulkan[-8:]))
+            raise ValueError(self.vulkan_problem(devices, seen, vulkan))
+        if len({device.get("deviceUUID") or device.get("deviceName") for device in cards}) < len(cards):
+            raise ValueError("Vulkan lists the one NVIDIA card more than once (two files name its driver), so the song "
+                             "engine could take it for two cards. Vulkan driver file: " + (seen.get("icd") or "none"))
         card = cards[0]
         facts = self.cuda_facts(found)
         facts["Vulkan"] = (f"{card.get('deviceName')} · {card.get('driverName', 'driver')} {card.get('driverInfo', '')}".strip()
@@ -1703,6 +1744,7 @@ class App:
         }
         for name in PARTS:
             parts[name]["label"] = PART_LABELS[name]
+            parts[name]["optional"] = name in OPTIONAL_PARTS
         return parts
 
     def do_parts_read(self, _body):
@@ -1715,6 +1757,7 @@ class App:
         """Every part not ready yet, downloaded by the studio one after another (it runs one download at a time), each
         followed until the studio counts it ready."""
         parts = self.do_parts_read({})
+        skipped = {}          # optional parts that did not complete, and why
         for name in PARTS:
             part = parts[name]
             if part.get("problem"):
@@ -1722,18 +1765,41 @@ class App:
             if part["ready"] or not part.get("can", True):
                 continue
             self.note("parts", f"{part['label']}: asking YuE2 Studio to download {size_text(part['missing_bytes'])}…")
-            getattr(self, "install_" + name)(part)
+            try:
+                getattr(self, "install_" + name)(part)
+            except Exception as error:  # noqa: BLE001 - an optional part is told, not a stop
+                if not part["optional"]:
+                    raise
+                skipped[name] = str(error)
+                continue
             parts = self.do_parts_read({})
             if not parts[name]["ready"]:
-                raise ValueError(f"{part['label']} finished downloading, but YuE2 Studio does not count it ready. "
-                                 + self.studio_said())
+                told = f"{part['label']} finished downloading, but YuE2 Studio does not count it ready. " + self.studio_said()
+                if not part["optional"]:
+                    raise ValueError(told)
+                skipped[name] = told
         facts = {}
         for name in PARTS:
             part = parts[name]
-            facts[part["label"]] = (f"ready · {part['detail']}" if part["ready"]
-                                    else f"not on this card: {part.get('why') or 'the studio says it cannot train here'}")
-        self.passed("parts", facts, key=None,
-                    note="" if parts["training"].get("can", True) else "LoRA training cannot run on this card.")
+            if part["ready"]:
+                facts[part["label"]] = f"ready · {part['detail']}"
+            elif not part.get("can", True):
+                facts[part["label"]] = f"not on this card: {part.get('why') or 'the studio says it cannot train here'}"
+            else:
+                facts[part["label"]] = ("not complete, optional (Open YuE2 Studio does not wait for it): "
+                                        + (skipped.get(name) or f"{size_text(part['missing_bytes'])} still missing"))
+        with self.lock:
+            for entry in self.steps["parts"]["data"].get("parts", []):
+                if entry["id"] in skipped:
+                    entry["skipped"] = skipped[entry["id"]]
+        notes = []
+        if not parts["training"].get("can", True):
+            notes.append("LoRA training cannot run on this card.")
+        if skipped:
+            notes.append("Everything required is ready; " + ", ".join(PART_LABELS[name] for name in skipped)
+                         + " did not complete (optional): the studio's Describe by ear may not work until it does. "
+                           "Download what is missing tries again.")
+        self.passed("parts", facts, key=None, note=" ".join(notes))
 
     def studio_said(self):
         """What YuE2 Studio printed last, where Beat Tool started it: its errors about a download go there."""
@@ -1754,14 +1820,18 @@ class App:
         """Waits for a download the studio runs. read answers (ready, the download at work). A download that fails, or
         nothing downloading for part_stall seconds while the part is still missing, is an error with what the studio
         printed."""
-        quiet_since = time.monotonic()
+        quiet_since, failing = time.monotonic(), 0
         while True:
             ready, active = read()
             if ready:
                 return
-            if isinstance(active, dict) and active.get("error"):
+            # an error still shown from an earlier try is not this one's: it must stand three polls in a row
+            failing = failing + 1 if isinstance(active, dict) and active.get("error") else 0
+            if failing >= 3:
                 raise ValueError(f"{label}: the download failed: {active['error']}")
-            if isinstance(active, dict) and not active.get("done"):
+            if failing:
+                self.note("parts", f"{label}: the studio reports a failed download; checking it is this try's…")
+            elif isinstance(active, dict) and not active.get("done"):
                 quiet_since = time.monotonic()
                 got, total = active.get("downloaded_bytes") or 0, active.get("total_bytes") or 0
                 self.note("parts", f"{label}: downloading {active.get('asset_id') or ''} "
@@ -1891,10 +1961,14 @@ class App:
             if not trainer.get("installed"):
                 raise StepProblem("start", "the studio runs without the LoRA trainer (YUE_TRAIN_BIN).")
             facts["LoRA trainer"] = self.trainer_exe()
-        missing = [part["label"] for name, part in parts.items() if not part["ready"] and part.get("can", True)]
+        missing = [part["label"] for part in parts.values()
+                   if not part["ready"] and part.get("can", True) and not part["optional"]]
         if missing:
             raise StepProblem("parts", "not ready: " + ", ".join(missing) + ".")
         facts["Parts"] = ", ".join(part["label"] for part in parts.values() if part["ready"])
+        incomplete = [part["label"] for part in parts.values() if not part["ready"] and part["optional"]]
+        if incomplete:
+            facts["Not complete (optional)"] = ", ".join(incomplete)
         free = self.disk_free_gb()
         if free is not None:
             if free < MIN_FREE_END_GB:
