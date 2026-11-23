@@ -77,6 +77,10 @@ input, select { font: inherit; font-size: 14px; color: var(--ink); background: v
 .option > div { min-width: 0; flex: 1; }
 .option small { color: var(--quiet); display: block; overflow-wrap: anywhere; }
 .option.ready { border-color: var(--ok); }
+.option.bad { border-color: var(--bad); }
+.option .problem { color: var(--bad); }
+.option .warning { color: var(--work); }
+#dataset-folder { flex: 1 1 420px; }
 details { margin-top: 8px; font-size: 13px; }
 details pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px Consolas, monospace; color: var(--quiet); }
 </style>
@@ -98,6 +102,14 @@ details pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px Consola
 <main>
   <div class="section">Setup · everything is checked before the studio opens</div>
   <div id="cards"></div>
+  <div class="section" id="dataset-section" hidden>LoRA dataset · once the studio runs</div>
+  <section class="card" id="card-dataset" hidden>
+    <h2><span>LoRA dataset</span><span class="badge"></span></h2>
+    <p class="what">A folder of songs, each with a .txt of the same name: its lyrics in sections ([Verse 1], [Chorus] … each on its own line), then a line “style:” and its style, or one style.txt for every song. YuE2 Studio reads a .txt as lyrics only and gives every uploaded song an empty style, so Send to YuE2 Studio sends the lyrics without the style lines, gives each song its style and asks the studio whether every song is ready. Set the styles in the studio does the same for a dataset you uploaded yourself, matched by file name.</p>
+    <div class="controls"><input id="dataset-folder" type="text" spellcheck="false" placeholder="C:\Users\you\Desktop\dataset_…"></div>
+    <div class="extra"></div><dl class="facts"></dl><p class="note"></p><div class="error"></div>
+    <div class="controls" id="dataset-buttons"></div>
+  </section>
 </main>
 <script>
 "use strict";
@@ -376,6 +388,48 @@ const R = {
   open() { once("open", c => c.append(gated(button("Open YuE2 Studio ↗", openStudio)))); },
 };
 
+// The LoRA dataset card: not a step of the chain. The folder field starts at your newest Desktop folder named dataset…,
+// and keeps what you write in it.
+let datasetTyped = false;
+
+function datasetCard() {
+  const D = S.dataset, el = $("#card-dataset");
+  $("#dataset-section").hidden = el.hidden = !D;
+  if (!D) return;
+  const folder = $("#dataset-folder");
+  if (!built.dataset) {
+    built.dataset = true;
+    folder.oninput = () => { datasetTyped = true; };
+    const run = what => () => act("dataset", { do: what, folder: folder.value });
+    const check = button("Check the folder", run("check"), true); check.id = "dataset-check";
+    const send = button("Send to YuE2 Studio", run("send")); send.id = "dataset-send";
+    const styles = button("Set the styles in the studio", run("styles"), true); styles.id = "dataset-styles";
+    $("#dataset-buttons").append(check, send, styles);
+  }
+  if (!datasetTyped && !folder.value && D.default) folder.value = D.default;
+  el.className = "card " + D.state;
+  $(".badge", el).textContent = D.state === "ok" ? "ready" : BADGE[D.state];
+  $("#dataset-check").disabled = !!S.busy || !!S.preparing;
+  $("#dataset-send").disabled = $("#dataset-styles").disabled = !D.can_send;
+  $("#dataset-send").title = $("#dataset-styles").title = D.can_send ? "" : "Once YuE2 Studio runs (Prepare everything)";
+  $(".facts", el).innerHTML = Object.entries(D.facts || {}).map(([k, v]) => "<dt>" + esc(k) + "</dt><dd>" + esc(v) + "</dd>").join("");
+  $(".note", el).textContent = D.note || "";
+  $(".error", el).textContent = D.error || "";
+  const data = D.data || {};
+  if (changed("dataset", data)) {
+    $(".extra", el).innerHTML = data.songs ? "<div>" + esc(data.name) + " · " + data.songs.length + " song" + (data.songs.length === 1 ? "" : "s") + "</div>" +
+      (data.warnings || []).map(w => '<div class="warning">' + esc(w) + "</div>").join("") +
+      '<div class="list">' + data.songs.map(s =>
+        '<div class="option' + (s.problems.length ? " bad" : " ready") + '"><div><b>' + esc(s.file) + "</b>" +
+        (s.seconds != null ? " · " + Number(s.seconds).toFixed(1) + " s" : "") + " · " +
+        (s.sections.length ? esc(s.sections.join(" ")) : "no sections") + " · " +
+        (s.style ? "style " + s.style.split(/\s+/).length + " words, from " + esc(s.style_from) : "no style") +
+        (s.style ? "<small>" + esc(s.style) + "</small>" : "") +
+        s.problems.map(x => '<small class="problem">' + esc(x) + "</small>").join("") +
+        s.warnings.map(x => '<small class="warning">' + esc(x) + "</small>").join("") + "</div></div>").join("") + "</div>" : "";
+  }
+}
+
 function header() {
   const between = S.order.slice(1, -1);
   const prepared = between.every(n => S.steps[n].state === "ok");
@@ -398,6 +452,7 @@ function render() {
   chain();
   header();
   for (const name of S.order) { if (!R[name]) { location.reload(); return; } R[name](); common(name); }
+  datasetCard();
 }
 
 async function refresh() {

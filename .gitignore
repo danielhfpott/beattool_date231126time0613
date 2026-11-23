@@ -7,6 +7,7 @@ studio/
 *.part
 YuE2-Studio-*.zip
 YuE2-Studio-*.AppImage
-# - your mixdowns, takes and stems
+# - your mixdowns, takes and stems, and the dataset copies sent to the studio (your audio)
 beats/
+datasets/
 __pycache__/

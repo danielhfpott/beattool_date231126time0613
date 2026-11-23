@@ -88,7 +88,7 @@ TRAINER_VRAM_GB = 11
 SETUP_PC = ("where", "gpu", "cuda", "studio", "start", "models", "engine", "parts", "open")
 SETUP_VAST = ("where", "gpu", "cuda", "studio", "trainer", "start", "models", "engine", "parts", "open")
 ORDER = SETUP_VAST                         # every step there is
-LABELS = {"where": "Where it runs", "gpu": "GPU", "cuda": "CUDA", "studio": "YuE2 Studio", "trainer": "LoRA trainer",
+LABELS = {"dataset": "LoRA dataset", "where": "Where it runs", "gpu": "GPU", "cuda": "CUDA", "studio": "YuE2 Studio", "trainer": "LoRA trainer",
           "start": "Studio running", "models": "Models", "engine": "Engine on the card", "parts": "Studio parts",
           "open": "Open YuE2 Studio"}
 # On the rented Linux machine the song engine computes through Vulkan: the studio ships its CUDA engine for Windows
@@ -253,6 +253,132 @@ def unpack(archive_path, folder):
         return len(archive.infolist())
 
 
+# ------------------------------------------------------------ a LoRA dataset folder, as you write it
+
+# What YuE2 Studio's training takes from a folder (training.rs, lib.rs upload_training_files at v3.8.4): audio, and a
+# same-named .txt read as its lyrics only. Every uploaded song comes in with an empty style, so Beat Tool sends the
+# lyrics without the style and gives each song its style itself.
+AUDIO_TYPES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aiff", ".aif")
+MIN_SONG_SECONDS = 10          # the trainer cuts songs into ten-second pieces; a shorter song is refused
+STYLE_WORDS = (35, 70)         # the studio's guide: one English sentence of 35-70 words, ending in the tempo
+SONGS_SUGGESTED = (5, 50)
+DATASETS_DIR = "datasets"      # the clean copies sent to the studio (your audio: never in git)
+STYLE_LINE = re.compile(r"^\s*style\s*:\s*(.*)$", re.I)
+ENDS_IN_TEMPO = re.compile(r"\b\d{2,3}(?:\.\d+)?\s*BPM\.?\s*$", re.I)
+
+
+def split_style(text):
+    """A .txt as you write it: the lyrics, then a line "style:" and the style (on that line or the lines after it).
+    Answers the lyrics and the style, the style as one line; no "style:" line, no style."""
+    lyrics, style, inside = [], [], False
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        found = None if inside else STYLE_LINE.match(line)
+        if found:
+            inside = True
+            line = found.group(1)
+        (style if inside else lyrics).append(line.strip() if inside else line.rstrip())
+    return "\n".join(lyrics).strip(), " ".join(part for part in style if part).strip()
+
+
+def section_tags(lyrics):
+    """The section headings the studio keeps: "[Verse 1]" on its own line. A tag with a colon ("[Chorus: x]") or a
+    time ("[00:12]") is taken away on upload as a tag of the file, not a section."""
+    tags = []
+    for line in (lyrics or "").splitlines():
+        line = line.strip()
+        if len(line) > 2 and line.startswith("[") and line.endswith("]"):
+            tag = line[1:-1]
+            if ":" not in tag and not tag[:1].isdigit():
+                tags.append(line)
+    return tags
+
+
+def wav_seconds(path):
+    """A WAV file's length from its header (PCM or float), or None for another kind of file."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(12)
+            if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+                return None
+            rate = block = None
+            while True:
+                chunk = handle.read(8)
+                if len(chunk) < 8:
+                    return None
+                kind, size = chunk[:4], int.from_bytes(chunk[4:], "little")
+                if kind == b"fmt ":
+                    body = handle.read(size + (size & 1))
+                    rate, block = int.from_bytes(body[4:8], "little"), int.from_bytes(body[12:14], "little")
+                    continue
+                if kind == b"data":
+                    return size / (rate * block) if rate and block else None
+                handle.seek(size + (size & 1), os.SEEK_CUR)
+    except OSError:
+        return None
+
+
+def read_dataset_folder(folder):
+    """Every song of a dataset folder as the studio will see it, and what stands in the way: problems stop the send,
+    warnings only say what the studio's guide asks for."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise ValueError(f"There is no folder {folder}.")
+    files = {path.name: path for path in folder.iterdir() if path.is_file()}
+    shared = ""
+    if "style.txt" in {name.lower() for name in files}:
+        shared = " ".join(Path(files[next(name for name in files if name.lower() == "style.txt")])
+                          .read_text(encoding="utf-8-sig", errors="replace").split())
+        shared = split_style(shared)[1] or shared
+    texts = {path.stem: path for path in files.values() if path.suffix.lower() == ".txt" and path.name.lower() != "style.txt"}
+    songs, warnings = [], []
+    for path in sorted((p for p in files.values() if p.suffix.lower() in AUDIO_TYPES), key=lambda p: p.name.lower()):
+        song = {"file": path.name, "stem": path.stem, "seconds": wav_seconds(path), "problems": [], "warnings": []}
+        text = texts.get(path.stem)
+        lyrics, style = split_style(text.read_text(encoding="utf-8-sig", errors="replace")) if text else ("", "")
+        song.update(lyrics=lyrics, style=style or shared, style_from=("its .txt" if style else "style.txt" if shared else ""),
+                    sections=section_tags(lyrics))
+        if song["seconds"] is not None and song["seconds"] < MIN_SONG_SECONDS:
+            song["problems"].append(f"{song['seconds']:.1f} s long: the studio refuses a song under {MIN_SONG_SECONDS} s "
+                                    "(its trainer cuts songs into ten-second pieces)")
+        if not text:
+            song["problems"].append(f"no {path.stem}.txt beside it with its lyrics")
+        elif not lyrics:
+            song["problems"].append(f"{path.stem}.txt holds no lyrics before its style")
+        elif not song["sections"]:
+            song["problems"].append(f"no section tags in {path.stem}.txt: put [Verse 1], [Chorus] … on their own lines "
+                                    "above the lines they head")
+        if not song["style"]:
+            song["problems"].append(f"no style: write it in {path.stem}.txt after a line \"style:\", or once for every "
+                                    "song in style.txt")
+        else:
+            words = len(song["style"].split())
+            if not STYLE_WORDS[0] <= words <= STYLE_WORDS[1]:
+                song["warnings"].append(f"the style has {words} words; the studio's guide asks for one sentence of "
+                                        f"{STYLE_WORDS[0]}-{STYLE_WORDS[1]}")
+            if not ENDS_IN_TEMPO.search(song["style"]):
+                song["warnings"].append("the style does not end in the song's own tempo (like \u201c…, 92 BPM.\u201d), as the studio's guide asks")
+        songs.append(song)
+    for stem in sorted(set(texts) - {song["stem"] for song in songs}):
+        warnings.append(f"{texts[stem].name} has no audio file of the same name beside it, so it is left out")
+    if not songs:
+        raise ValueError(f"{folder} holds no song ({', '.join(AUDIO_TYPES)}).")
+    if not SONGS_SUGGESTED[0] <= len(songs) <= SONGS_SUGGESTED[1]:
+        warnings.append(f"{len(songs)} songs; the studio suggests {SONGS_SUGGESTED[0]}-{SONGS_SUGGESTED[1]}")
+    return {"folder": str(folder), "name": folder.name, "songs": songs, "warnings": warnings,
+            "problems": sum(len(song["problems"]) for song in songs)}
+
+
+def newest_dataset_folder(desktop=None):
+    """Your newest Desktop folder whose name begins with "dataset" and that holds audio, or None."""
+    desktop = Path(desktop) if desktop else Path.home() / "Desktop"
+    try:
+        found = [path for path in desktop.iterdir() if path.is_dir() and path.name.lower().startswith("dataset")
+                 and any(child.suffix.lower() in AUDIO_TYPES for child in path.iterdir())]
+    except OSError:
+        return None
+    return str(max(found, key=lambda path: path.stat().st_mtime)) if found else None
+
+
 class Studio:
     """YuE2 Studio's MCP server: JSON-RPC over HTTP, one request per POST, no browser origin."""
 
@@ -354,6 +480,7 @@ class App:
         self.prior = {}
         self.busy = self.preparing = None
         self.part_stall = PART_STALL
+        self.dataset = {"state": "open", "note": "", "error": "", "facts": {}, "data": {}}     # the LoRA dataset card
         self.gpu = self.exe = self.version = self.profile = None
         self.process = None
         # Where the work runs: this PC, or a machine rented on vast.ai, reached as self.remote over SSH.
@@ -838,10 +965,44 @@ class App:
     def trainer_note(self, text):
         self.note("trainer", text)
 
+    def machine_libraries(self, roots, lenient=()):
+        """Every program and library under roots on the rented machine asked what it links and the machine lacks;
+        what has a known package is installed there and asked again. A library still missing is an error, except for
+        files under a lenient folder (the studio's bundled media plugins, which link sound and camera libraries the
+        studio does not need): those are told. Returns (packages installed, what is told)."""
+        try:
+            lines = self.on_remote().sh(beat_remote.libraries_script(roots), timeout=1200).splitlines()
+        except RemoteError as error:
+            raise ValueError(f"Checking the libraries on the rented machine ended early: {error}") from None
+        if not any(line.startswith("@@scanned") for line in lines):
+            raise ValueError("Checking the libraries on the rented machine ended early. What it printed last:\n"
+                             + "\n".join(lines[-8:]))
+        installed = [package for line in lines if line.startswith("@@installed") for package in line[11:].split()]
+        hard, soft = {}, {}
+        for line in lines:
+            if line.startswith("@@missing "):
+                library, _, file = line[10:].partition(" ")
+                lenient_file = any(file.startswith(prefix.rstrip("/") + "/") for prefix in lenient)
+                (soft if lenient_file else hard).setdefault(library, []).append(file)
+
+        def told(found):
+            return "; ".join(f"{library} (needed by {files[0]}" + (f" and {len(files) - 1} more" if len(files) > 1 else "")
+                             + ")" for library, files in sorted(found.items()))
+        if hard:
+            logs = [line[6:] for line in lines if line.startswith("@@log ")]
+            raise ValueError("Libraries missing on the rented machine that Beat Tool has no package for: " + told(hard)
+                             + ("\n" + "\n".join(logs) if logs else ""))
+        return installed, told(soft)
+
     def do_trainer(self, _body):
         """The LoRA trainer on the rented machine, before the studio starts there, so the studio starts with it (a studio
-        already running without it is stopped, and Start brings it back with it)."""
+        already running without it is stopped, and Start brings it back with it). Whichever way it came, everything
+        it links must be on this machine before the step is green."""
         record, how = self.trainer_ready()
+        self.trainer_note("Checking that this machine has every library the trainer links…")
+        installed, _ = self.machine_libraries([beat_remote.trainer_folder(TRAINER_COMMIT)])
+        if installed:
+            how += f"; installed what it links here: {', '.join(installed)}"
         note = self.trainer_into_studio()
         facts = {"Trainer": self.trainer_exe(), "How": how,
                  "Built from": f"HOT-Step-CPP {TRAINER_COMMIT[:8]}, the commit YuE2 Studio {REMOTE_VERSION} pins",
@@ -1072,8 +1233,11 @@ class App:
                  + ". The studio's song engine computes through Vulkan there, so it would run on the processor.\n")
         printed = "\nWhat vulkaninfo printed last:\n" + "\n".join(vulkan[-8:])
         if seen.get("glx", "0") in ("", "0"):
-            return (start + "The machine has no NVIDIA Vulkan driver (libGLX_nvidia is not in its image). Stop renting it "
-                            "and rent another." + printed)
+            why = (f" Beat Tool could not add it: {seen['nvglfail']}." if seen.get("nvglfail") else "")
+            return (start + "The host gave the machine only the compute part of the NVIDIA driver, not its Vulkan part "
+                            f"(libGLX_nvidia).{why} Stop renting it and rent another." + printed)
+        if seen.get("nvgl"):
+            start += f"Beat Tool added the driver's Vulkan part ({seen['nvgl']}), which the host had left out.\n"
         missing = seen.get("glxmissing", "").split() + ([] if seen.get("egl", "1") not in ("", "0") else ["libEGL.so.1"])
         if missing:
             return (start + f"The card's Vulkan driver is there, but what it needs is missing: {', '.join(missing)}. Beat "
@@ -1106,7 +1270,7 @@ class App:
                              "CUDA 13 builds. Stop renting it and rent another.")
         seen = {}
         for line in lines:
-            if line.startswith(("@@icd ", "@@glx ", "@@glxmissing ", "@@egl ")):
+            if line.startswith(("@@icd ", "@@glx ", "@@glxmissing ", "@@egl ", "@@nvgl ", "@@nvglfail ")):
                 key, _, value = line[2:].partition(" ")
                 seen[key] = value.strip()
         vulkan, inside_summary = [], False
@@ -1130,6 +1294,8 @@ class App:
         facts["Vulkan"] = (f"{card.get('deviceName')} · {card.get('driverName', 'driver')} {card.get('driverInfo', '')}".strip()
                            + f" · Vulkan {card.get('apiVersion', '?')}")
         facts["Vulkan driver file"] = seen.get("icd") or "none"
+        if seen.get("nvgl"):
+            facts["Vulkan part of the driver"] = f"added by Beat Tool ({seen['nvgl']}): the host had left it out"
         self.passed("cuda", facts, key=f"vast|{found.get('name')}|{found.get('driver_cuda')}|{card.get('deviceName')}")
 
     def remote_studio_found(self):
@@ -1793,6 +1959,15 @@ class App:
                 if entry["id"] in skipped:
                     entry["skipped"] = skipped[entry["id"]]
         notes = []
+        if self.mode == "vast" and self.remote_folder:
+            # everything the studio downloaded runs on this machine: what it links must be here now, not found missing
+            # in the middle of your work
+            self.note("parts", "Checking that the machine has every library the studio's programs and the trainer link…")
+            installed, plugins = self.machine_libraries(
+                [self.remote_folder, beat_remote.trainer_folder(TRAINER_COMMIT)], lenient=[self.remote_folder + "/usr/lib"])
+            facts["System libraries"] = "all there" + (f"; installed now: {', '.join(installed)}" if installed else "")
+            if plugins:
+                facts["Not needed, missing"] = plugins
         if not parts["training"].get("can", True):
             notes.append("LoRA training cannot run on this card.")
         if skipped:
@@ -1986,6 +2161,151 @@ class App:
         except (RemoteError, OSError, ValueError):
             return None
 
+    # ------------------------------------------------------------ a LoRA dataset, sent with its styles
+
+    def dataset_click(self, body):
+        """The LoRA dataset card: check a folder (here, nothing sent), send it to the studio as a new dataset with every
+        song's style, or give the styles to the songs of a dataset of that name already in the studio. Not a step of
+        the chain; it holds the chain while it works."""
+        kind, folder = str(body.get("do") or ""), str(body.get("folder") or "").strip().strip('"')
+        if kind not in ("check", "send", "styles"):
+            raise Refused(f"There is no such dataset action: {kind}.")
+        if not folder:
+            raise Refused("Write the dataset folder's path first (for example C:\\Users\\you\\Desktop\\dataset_…).")
+        with self.lock:
+            if self.preparing or self.busy:
+                raise Refused(f"Wait: {self.label(self.busy or self.preparing)} is still working.")
+            if kind != "check" and self.steps["start"]["state"] != "ok":
+                raise Refused("First get YuE2 Studio running (Prepare everything): the dataset goes into that studio.")
+            self.busy = "dataset"
+            self.dataset = {"state": "working", "note": "Reading the folder…", "error": "", "facts": {},
+                            "data": self.dataset.get("data") or {}}
+        thread = threading.Thread(target=self._dataset_work, args=(kind, folder), daemon=True)
+        thread.start()
+        return thread
+
+    def dataset_note(self, text):
+        with self.lock:
+            self.dataset["note"] = text
+
+    def _dataset_work(self, kind, folder):
+        try:
+            read = read_dataset_folder(folder)
+            with self.lock:
+                self.dataset["data"] = read
+            if read["problems"]:
+                raise ValueError(f"{read['problems']} thing{'s' if read['problems'] != 1 else ''} to fix in the folder "
+                                 "first: each is named under its song.")
+            if kind == "check":
+                facts, note = {"Folder": read["folder"], "Songs": f"{len(read['songs'])}, each with lyrics in sections "
+                                                                    "and a style"}, "Ready to send."
+            elif kind == "send":
+                facts, note = self.dataset_send(read)
+            else:
+                facts, note = self.dataset_styles(read)
+            with self.lock:
+                self.dataset.update(state="ok", note=note, error="", facts=facts)
+        except Exception as error:  # noqa: BLE001 - shown word for word
+            with self.lock:
+                self.dataset.update(state="failed", note="", error=str(error), facts={})
+        finally:
+            with self.lock:
+                self.busy = None
+
+    def studio_datasets(self):
+        return self.studio.call("training_status").get("datasets") or []
+
+    def dataset_items(self, dataset_id):
+        answer = self.studio.call("dataset_get", {"dataset_id": dataset_id})
+        return (answer.get("dataset") or answer).get("items") or []
+
+    def dataset_send(self, read):
+        """A new dataset named after the folder: the audio and the lyrics without their style lines, sent as a folder the
+        studio reads (on a rented machine, copied there first, each file checked by its SHA-256), then every song's
+        style written, and the studio asked whether every song is ready."""
+        name = read["name"]
+        if any(dataset.get("name") == name for dataset in self.studio_datasets()):
+            raise ValueError(f"YuE2 Studio already has a dataset named {name}. To give its songs their styles, click Set the "
+                             "styles in the studio; to send the folder again, delete that dataset in the studio first, "
+                             "or rename the folder.")
+        if not re.fullmatch(r"[^/\\:*?\"<>|\x00-\x1f]+", name) or name in (".", ".."):
+            raise ValueError(f"The folder's name {name!r} cannot be a dataset's folder name: rename the folder.")
+        staged = self.folder / DATASETS_DIR / name
+        if staged.exists():
+            shutil.rmtree(staged)
+        staged.mkdir(parents=True)
+        for song in read["songs"]:
+            shutil.copy2(Path(read["folder"]) / song["file"], staged / song["file"])
+            (staged / f"{song['stem']}.txt").write_text(song["lyrics"] + "\n", encoding="utf-8")
+        if self.mode == "vast":
+            remote = self.on_remote()
+            there = f"{beat_remote.REMOTE_ROOT}/{DATASETS_DIR}/{name}"
+            remote.sh(f"rm -rf {shlex.quote(there)}", timeout=120)
+            files = sorted(staged.iterdir())
+            for number, path in enumerate(files, 1):
+                self.dataset_note(f"Sending {path.name} to the rented machine ({number} of {len(files)})…")
+                remote.put(path, f"{there}/{path.name}", sha256(path))
+        else:
+            there = str(staged)
+        self.dataset_note(f"Making the dataset {name} in YuE2 Studio…")
+        dataset_id = need(self.studio.call("dataset_create", {"name": name}), "id", "dataset_create")
+        try:
+            self.dataset_note(f"Adding {len(read['songs'])} songs to it…")
+            self.studio.call("dataset_add_folder", {"dataset_id": dataset_id, "path": there}, timeout=1800)
+            facts = self.dataset_give_styles(dataset_id, read)
+        except Exception as error:
+            try:
+                self.studio.call("dataset_delete", {"dataset_id": dataset_id})
+                gone = "The half-made dataset was taken out of the studio again."
+            except StudioError as removal:
+                gone = f"The half-made dataset {name} is still in the studio ({removal}): delete it there."
+            raise ValueError(f"{error}\n{gone}") from None
+        return {"Dataset": f"{name} (new in YuE2 Studio)", **facts}, "Sent. In the studio: LoRA · Training, open the dataset."
+
+    def dataset_styles(self, read):
+        """The styles of the folder given to the songs of the studio's dataset of the same name, as you uploaded it."""
+        found = [dataset for dataset in self.studio_datasets() if dataset.get("name") == read["name"]]
+        if not found:
+            raise ValueError(f"YuE2 Studio has no dataset named {read['name']}: upload the folder there first, or click "
+                             "Send to YuE2 Studio, which makes it.")
+        if len(found) > 1:
+            raise ValueError(f"YuE2 Studio has {len(found)} datasets named {read['name']}: delete or rename the others.")
+        return {"Dataset": f"{read['name']} (already in YuE2 Studio)", **self.dataset_give_styles(found[0]["id"], read)}, \
+            "Styles given. Reload the studio's page (F5): it does not see a change made from outside by itself."
+
+    def dataset_give_styles(self, dataset_id, read):
+        """Every song of the folder found in the studio's dataset by its file name, given its style; then the studio's
+        own count of ready songs."""
+        by_file = {song["file"].lower(): song for song in read["songs"]}
+        by_stem = {song["stem"].lower(): song for song in read["songs"]}
+        given, unknown = 0, []
+        for item in self.dataset_items(dataset_id):
+            source = str(item.get("source") or "").split(":", 1)[-1].replace("\\", "/").rsplit("/", 1)[-1].lower()
+            song = by_file.get(source) or by_stem.get(str(item.get("title") or "").lower())
+            if not song:
+                unknown.append(str(item.get("title") or item.get("id")))
+                continue
+            song["matched"] = True
+            if item.get("style") != song["style"]:
+                self.dataset_note(f"Giving {song['file']} its style…")
+                self.studio.call("dataset_song_update", {"dataset_id": dataset_id, "song_id": item["id"],
+                                                         "style": song["style"]})
+                given += 1
+        missing = [song["file"] for song in read["songs"] if not song.pop("matched", False)]
+        if missing:
+            raise ValueError("These songs of the folder are not in the studio's dataset: " + ", ".join(missing))
+        items = self.dataset_items(dataset_id)
+        ready = [item for item in items if item.get("lyrics_state") == "done" and item.get("style_state") == "done"]
+        if len(ready) != len(items):
+            lacking = [f"{item.get('title')} (lyrics {item.get('lyrics_state')}, style {item.get('style_state')})"
+                       for item in items if item not in ready]
+            raise ValueError(f"YuE2 Studio counts {len(ready)} of {len(items)} songs ready; not ready: " + "; ".join(lacking))
+        facts = {"Ready": f"{len(ready)} of {len(items)} songs (YuE2 Studio's own count)",
+                 "Styles written now": str(given)}
+        if unknown:
+            facts["Also in the dataset"] = ", ".join(unknown) + " (not in the folder: left as they are)"
+        return facts
+
     # ------------------------------------------------------------ the page
 
     def snapshot(self):
@@ -1997,6 +2317,8 @@ class App:
                           for name in order},
                 "busy": self.busy, "preparing": self.preparing,
                 "can": {name: not self.busy and not self.preparing and not self.missing_before(name) for name in order},
+                "dataset": {**self.dataset, "default": newest_dataset_folder(),
+                            "can_send": not self.busy and not self.preparing and self.steps["start"]["state"] == "ok"},
             }
             if self.mode == "vast":
                 state["pin"] = {"tag": REMOTE_TAG, "asset": LINUX_ASSET, "bytes": LINUX_BYTES, "url": LINUX_URL,
@@ -2054,6 +2376,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.prepare_click(body)
             elif action == "open":
                 return self.send(200, {"ok": True, "url": self.app.open_click()})
+            elif action == "dataset":
+                self.app.dataset_click(body)
             else:
                 self.app.act(action, body)
         except Refused as error:

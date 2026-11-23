@@ -606,7 +606,25 @@ answer()
 
 # What the studio's libraries load on the rented machine: audio.cpp's CUDA 13 server (SheetSage2, HT-Demucs, MuScriptor).
 RUNTIME_LIBRARIES = ("libcudart.so.13", "libcublas.so.13", "libcufft.so.12")
-VULKAN_ICD = '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3"}}'
+# System libraries the studio's programs and the trainer link that the CUDA runtime image lacks, installed on every
+# rented machine at its first step: OpenMP and atomics (ggml's processor code; a trainer sent from home links OpenMP,
+# which a machine that built it had from the compiler: a fresh RTX 4090 on 23 Nov 2026 refused it without), ALSA and
+# libusb (the studio's bundled media libraries link them).
+MACHINE_PACKAGES = {"libgomp.so.1": "libgomp1", "libatomic.so.1": "libatomic1", "libasound.so.2": "libasound2",
+                    "libusb-1.0.so.0": "libusb-1.0-0"}
+# A library a program there turns out to link but the machine lacks, and the Ubuntu 22.04 package that brings it.
+LIBRARY_PACKAGES = {
+    **MACHINE_PACKAGES, "libquadmath.so.0": "libquadmath0", "libgfortran.so.5": "libgfortran5",
+    "libstdc++.so.6": "libstdc++6", "libgcc_s.so.1": "libgcc-s1", "libz.so.1": "zlib1g", "libnuma.so.1": "libnuma1",
+    "libsndfile.so.1": "libsndfile1", "libpulse.so.0": "libpulse0", "libssl.so.3": "libssl3", "libcrypto.so.3": "libssl3",
+    "libcurl.so.4": "libcurl4", "libvulkan.so.1": "libvulkan1", "libX11.so.6": "libx11-6", "libXext.so.6": "libxext6",
+    "libEGL.so.1": "libegl1", "libGL.so.1": "libgl1", "libGLdispatch.so.0": "libglvnd0",
+    "libOpenCL.so.1": "ocl-icd-libopencl1", "libopenblas.so.0": "libopenblas0", "libfftw3f.so.3": "libfftw3-single3",
+    "libbz2.so.1.0": "libbz2-1.0", "liblzma.so.5": "liblzma5", "libzstd.so.1": "libzstd1", "libxml2.so.2": "libxml2",
+    "libsqlite3.so.0": "libsqlite3-0", "libdrm.so.2": "libdrm2", "libgbm.so.1": "libgbm1", "libxcb.so.1": "libxcb1",
+    "libSDL2-2.0.so.0": "libsdl2-2.0-0", "libsamplerate.so.0": "libsamplerate0", "libjack.so.0": "libjack-jackd2-0",
+}
+VULKAN_ICD ='{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3"}}'
 
 
 def compute_script():
@@ -615,10 +633,14 @@ def compute_script():
     test needs (python3, vulkan-tools, the Vulkan loader) and what the card's Vulkan driver (libGLX_nvidia, mounted from
     the host) needs but the CUDA image lacks: libXext and libX11, which it links, and libEGL, which driver 615 opens
     before it starts Vulkan and refuses without (both seen on a rented RTX 4090 on 23 Nov 2026; the studio's own
-    packages bring them later, too late for this test). Where the NVIDIA runtime mounted that driver without the file
-    that names it, writes that file. Prints @@ lines, one @@json line from the probe and the vulkaninfo summary between
-    @@vulkan-begin and @@vulkan-end."""
+    packages bring them later, too late for this test). Where the host mounted only the compute part of the driver
+    (no libGLX_nvidia at all: another rented RTX 4090, driver 595.91.07, the same day), adds its graphics part at
+    exactly the host's driver version: from NVIDIA's CUDA repository the image carries, or else from NVIDIA's installer
+    for that version (@@nvgl names where from, @@nvglfail why not). Where the NVIDIA runtime mounted that driver without
+    the file that names it, writes that file. Prints @@ lines, one @@json line from the probe and the vulkaninfo summary
+    between @@vulkan-begin and @@vulkan-end."""
     q = shlex.quote
+    machine = "\n".join(f'have {q(library)} || need="$need {package}"' for library, package in MACHINE_PACKAGES.items())
     return f"""
 set -u
 export DEBIAN_FRONTEND=noninteractive
@@ -632,12 +654,82 @@ have 'libXext.so.6' || need="$need libxext6"
 have 'libX11.so.6' || need="$need libx11-6"
 have 'libGLdispatch.so.0' || need="$need libglvnd0"
 have 'libEGL.so.1' || need="$need libegl1"
+# and what the studio's programs and the trainer link later (MACHINE_PACKAGES), here once for everything after
+{machine}
 if [ -n "$need" ]; then
-  echo "@@ Installing what the test needs:$need…"
+  echo "@@ Installing what the test and the studio need:$need…"
   if ! {{ apt-get update -q && apt-get install -y -q --no-install-recommends $need; }} </dev/null > /tmp/beat_tool_test_packages.log 2>&1; then
     tail -n 8 /tmp/beat_tool_test_packages.log | sed 's/^/@@log /'
     echo "@@error The packages for the test ($need) did not install on the rented machine."
     exit 0
+  fi
+fi
+# The graphics part of the host's NVIDIA driver, when the host mounted only its compute part: the libraries refuse
+# any version but the kernel driver's own, so only that exact version is taken. Only files the machine lacks are
+# written; the download is deleted afterwards.
+if ! have 'libGLX_nvidia.so.0'; then
+  v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d ' ')
+  if [ -z "$v" ]; then
+    echo "@@nvglfail nvidia-smi does not say the driver's version"
+  else
+    echo "@@ The host gave this machine only the compute part of NVIDIA driver $v; adding its Vulkan part…"
+    work=/tmp/beat_tool_nvgl
+    rm -rf "$work" && mkdir -p "$work/x"
+    exact() {{ apt-cache madison "$1" 2>/dev/null | awk -F'|' -v v="$v-" '{{ gsub(/ /, "", $2); if (index($2, v) == 1) {{ print $2; exit }} }}'; }}
+    pick() {{ for p in "$@"; do e=$(exact "$p"); if [ -n "$e" ]; then echo "$p=$e"; return; fi; done; }}
+    gl=$(pick libnvidia-gl "libnvidia-gl-${{v%%.*}}")
+    if [ -z "$gl" ]; then
+      apt-get update -q </dev/null >>"$work/log" 2>&1
+      gl=$(pick libnvidia-gl "libnvidia-gl-${{v%%.*}}")
+    fi
+    from=""
+    if [ -n "$gl" ]; then
+      comp=$(pick libnvidia-gpucomp "libnvidia-gpucomp-${{v%%.*}}")
+      if (cd "$work" && apt-get download $gl $comp) </dev/null >>"$work/log" 2>&1; then
+        for deb in "$work"/*.deb; do dpkg-deb -x "$deb" "$work/x"; done
+        src="$work/x/usr/lib/x86_64-linux-gnu"
+        icd_from="$work/x/usr/share/vulkan/icd.d/nvidia_icd.json"
+        egl_from="$work/x/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+        from="${{gl%%=*}} $v from NVIDIA's CUDA repository"
+      fi
+    fi
+    if [ -z "$from" ]; then
+      run="NVIDIA-Linux-x86_64-$v.run"
+      echo "@@ Driver $v is not in NVIDIA's CUDA repository; downloading NVIDIA's installer for it (about 420 MB)…"
+      if curl -fsSL --retry 3 -o "$work/$run" "https://download.nvidia.com/XFree86/Linux-x86_64/$v/$run" </dev/null >>"$work/log" 2>&1 \\
+         && sh "$work/$run" --extract-only --target "$work/x/run" </dev/null >>"$work/log" 2>&1; then
+        src="$work/x/run"
+        icd_from=$(ls "$src"/nvidia_icd.json* 2>/dev/null | head -n1)
+        egl_from="$src/10_nvidia.json"
+        from="NVIDIA's installer for driver $v"
+      fi
+    fi
+    if [ -n "$from" ]; then
+      for lib in libGLX_nvidia libEGL_nvidia libGLESv2_nvidia libGLESv1_CM_nvidia libnvidia-glcore libnvidia-eglcore \\
+                 libnvidia-glsi libnvidia-tls libnvidia-glvkspirv libnvidia-gpucomp libnvidia-rtcore libnvidia-present \\
+                 libnvidia-allocator; do
+        if [ -e "$src/$lib.so.$v" ] && [ ! -e "/usr/lib/x86_64-linux-gnu/$lib.so.$v" ]; then
+          cp "$src/$lib.so.$v" /usr/lib/x86_64-linux-gnu/
+        fi
+      done
+      if [ ! -e /usr/share/vulkan/icd.d/nvidia_icd.json ] && [ ! -e /etc/vulkan/icd.d/nvidia_icd.json ] && [ -n "$icd_from" ] && [ -e "$icd_from" ]; then
+        mkdir -p /usr/share/vulkan/icd.d
+        sed 's/__NV_VK_ICD__/libGLX_nvidia.so.0/' "$icd_from" > /usr/share/vulkan/icd.d/nvidia_icd.json
+      fi
+      if [ ! -e /usr/share/glvnd/egl_vendor.d/10_nvidia.json ] && [ -e "$egl_from" ]; then
+        mkdir -p /usr/share/glvnd/egl_vendor.d
+        cp "$egl_from" /usr/share/glvnd/egl_vendor.d/
+      fi
+      ldconfig
+    fi
+    if have 'libGLX_nvidia.so.0'; then
+      echo "@@nvgl $from"
+    elif [ -n "$from" ]; then
+      echo "@@nvglfail its files from $from did not take"
+    else
+      echo "@@nvglfail neither NVIDIA's CUDA repository nor NVIDIA's download site has driver $v ($(tail -n 1 "$work/log" 2>/dev/null))"
+    fi
+    rm -rf "$work"
   fi
 fi
 # only when neither place has it: "ls a b" fails when either is missing, which once wrote a second file beside the
@@ -903,7 +995,8 @@ echo "@@json $(cat {q(folder)}/{TRAINER_RECORD})"
 
 def trainer_unpack_script(tarball, folder, exe_sha256):
     """Unpacks a trainer brought from home into folder there and checks its program against the SHA-256 it was built
-    with; prints @@json with its record."""
+    with; prints @@json with its record. What it links is libraries_script's to check, after (the machine it was built
+    on had the compiler's libraries; this one may not)."""
     q = shlex.quote
     return f"""
 set -euo pipefail
@@ -912,9 +1005,55 @@ rm -rf {q(folder)}
 tar -xzf {q(tarball)} -C {q(REMOTE_ROOT)}
 sum=$(sha256sum {q(folder)}/{TRAINER_EXE} | cut -d' ' -f1)
 if [ "$sum" != {q(exe_sha256)} ]; then echo "@@error The unpacked {TRAINER_EXE} has SHA-256 $sum, not {exe_sha256}."; exit 3; fi
-missing=$(LD_LIBRARY_PATH={q(folder)} ldd {q(folder)}/{TRAINER_EXE} | grep 'not found' || true)
-if [ -n "$missing" ]; then echo "$missing" | sed 's/^/@@log /'; echo "@@error Libraries {TRAINER_EXE} needs are missing on this machine."; exit 4; fi
 echo "@@json $(cat {q(folder)}/{TRAINER_RECORD})"
+"""
+
+
+def libraries_script(roots):
+    """Every program and library under roots there (ELF files: executables and lib*.so*), asked with ldd what it links
+    and the machine lacks, each with the library folders of its own root on the search path (as the studio's
+    launcher and the trainer's $ORIGIN give it). Libraries with a package in LIBRARY_PACKAGES are installed, then
+    everything is asked again. Prints @@installed <packages>, @@log lines of an install that failed, one
+    @@missing <library> <file> per library still missing, and @@scanned <files> at the end."""
+    q = shlex.quote
+    table = " ".join(f"{library}={package}" for library, package in LIBRARY_PACKAGES.items())
+    return f"""
+set -u
+export DEBIAN_FRONTEND=noninteractive
+scanned=0
+missing_under() {{
+  local dirs
+  dirs=$(find "$1" -type f \\( -name '*.so' -o -name '*.so.*' \\) -printf '%h\\n' 2>/dev/null | sort -u | tr '\\n' ':')
+  find "$1" -type f \\( -name '*.so' -o -name '*.so.*' -o -perm -u+x \\) 2>/dev/null | while IFS= read -r f; do
+    case "$(head -c 4 "$f" 2>/dev/null)" in *ELF) ;; *) continue ;; esac
+    echo "@@file"
+    LD_LIBRARY_PATH="$dirs" ldd "$f" 2>/dev/null | awk -v f="$f" '/=> not found/ {{ print $1 " " f }}'
+  done
+}}
+missing_all() {{
+  for root in {" ".join(q(root) for root in roots)}; do
+    if [ -d "$root" ]; then missing_under "$root"; fi
+  done
+}}
+found=$(missing_all)
+need=""
+for library in $(echo "$found" | grep -v '^@@file' | awk '{{ print $1 }}' | sort -u); do
+  for pair in {table}; do
+    if [ "${{pair%%=*}}" = "$library" ]; then
+      case " $need " in *" ${{pair#*=}} "*) ;; *) need="$need ${{pair#*=}}" ;; esac
+    fi
+  done
+done
+if [ -n "$need" ]; then
+  if {{ apt-get update -q && apt-get install -y -q --no-install-recommends $need; }} </dev/null > /tmp/beat_tool_libraries.log 2>&1; then
+    echo "@@installed$need"
+  else
+    tail -n 6 /tmp/beat_tool_libraries.log | sed 's/^/@@log /'
+  fi
+  found=$(missing_all)
+fi
+echo "$found" | grep -v '^@@file' | sort -u | awk 'NF {{ print "@@missing " $0 }}'
+echo "@@scanned $(echo "$found" | grep -c '^@@file')"
 """
 
 

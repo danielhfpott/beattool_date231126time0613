@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -361,14 +362,19 @@ class TrainerStudio:
 class FakeTrainerRemote:
     """The rented machine as Add the LoRA trainer sees it: what each script it is sent answers."""
 
-    def __init__(self, found=None, running="none", build_lines=(), tar=b"the trainer, packed"):
+    def __init__(self, found=None, running="none", build_lines=(), tar=b"the trainer, packed", libraries="@@scanned 12\n"):
         self.found, self.running, self.build_lines, self.tar = found, running, list(build_lines), tar
+        self.libraries = libraries
         self.calls, self.sent, self.script = [], None, ""
 
     def __str__(self):
         return "root@203.0.113.7:40000"
 
     def sh(self, script, timeout=120):
+        if "@@scanned" in script:
+            self.calls.append("libraries")
+            self.libraries_script = script
+            return self.libraries
         if "@@record" in script and beat_remote.TRAINER_RECORD in script:
             self.calls.append("found")
             if not self.found:
@@ -450,7 +456,7 @@ class TrainerTest(unittest.TestCase):
             "@@ Building ace-train with 36 processors: [812/1450] compile steps", f"@@json {json.dumps(TRAINER_RECORD)}"])
         trainer = self.click(remote)
         self.assertEqual(trainer["state"], "ok", trainer["error"])
-        self.assertEqual(remote.calls, ["found", "build", "get", "uses", "stop"])
+        self.assertEqual(remote.calls, ["found", "build", "get", "libraries", "uses", "stop"])
         self.assertIn(beat_tool.TRAINER_COMMIT, remote.script)
         self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=86", remote.script)
         self.assertIn(beat_remote.CMAKE_SHA256, remote.script)
@@ -471,7 +477,7 @@ class TrainerTest(unittest.TestCase):
         remote = FakeTrainerRemote(running="none")
         trainer = self.click(remote)
         self.assertEqual(trainer["state"], "ok", trainer["error"])
-        self.assertEqual(remote.calls, ["found", "put", "unpack", "uses"])
+        self.assertEqual(remote.calls, ["found", "put", "unpack", "libraries", "uses"])
         self.assertEqual(remote.sent, (b"built before", beat_remote.trainer_folder(beat_tool.TRAINER_COMMIT) + ".tar.gz", digest))
         self.assertIn("sent from this PC", trainer["facts"]["How"])
         self.assertIn("Studio running starts YuE2 Studio with this trainer", trainer["note"])
@@ -481,9 +487,47 @@ class TrainerTest(unittest.TestCase):
         remote = FakeTrainerRemote(found=TRAINER_RECORD, running="yes")
         trainer = self.click(remote)
         self.assertEqual(trainer["state"], "ok", trainer["error"])
-        self.assertEqual(remote.calls, ["found", "uses"])
+        self.assertEqual(remote.calls, ["found", "libraries", "uses"])
         self.assertIn("already uses this trainer", trainer["note"])
         self.assertEqual(self.studio.last, "runtime_status")
+
+    def sent_from_home(self, libraries):
+        self.cache.parent.mkdir(parents=True, exist_ok=True)
+        self.cache.write_bytes(b"built before")
+        beat_tool.write_json(self.cache.with_suffix("").with_suffix(".json"),
+                             {**TRAINER_RECORD, "tar_sha256": hashlib.sha256(b"built before").hexdigest()})
+        remote = FakeTrainerRemote(running="none", libraries=libraries)
+        return remote, self.click(remote)
+
+    def test_a_trainer_from_home_gets_what_it_links_on_a_fresh_machine(self):
+        # built where the compiler had brought OpenMP; a fresh RTX 4090 lacked libgomp.so.1 (23 Nov 2026)
+        remote, trainer = self.sent_from_home("@@installed libgomp1\n@@scanned 14\n")
+        self.assertEqual(trainer["state"], "ok", trainer["error"])
+        self.assertIn("installed what it links here: libgomp1", trainer["facts"]["How"])
+        self.assertIn(beat_remote.trainer_folder(beat_tool.TRAINER_COMMIT), remote.libraries_script)
+        self.assertIn("libgomp.so.1=libgomp1", remote.libraries_script)
+
+    def test_a_library_no_package_brings_keeps_the_trainer_red(self):
+        folder = beat_remote.trainer_folder(beat_tool.TRAINER_COMMIT)
+        remote, trainer = self.sent_from_home(f"@@missing libweird.so.3 {folder}/libggml-cpu-zen4.so\n@@scanned 14\n")
+        self.assertEqual(trainer["state"], "failed")
+        self.assertIn("Libraries missing on the rented machine that Beat Tool has no package for: libweird.so.3 "
+                      f"(needed by {folder}/libggml-cpu-zen4.so)", trainer["error"])
+        self.assertNotIn("uses", remote.calls)
+
+    def test_a_trainer_already_there_is_checked_too(self):
+        # a first try that stopped at a missing library leaves the trainer unpacked: the next must not pass it unchecked
+        remote = FakeTrainerRemote(found=TRAINER_RECORD, running="none",
+                                   libraries="@@missing libgomp.so.1 /root/beat_tool/trainer-5ae17a66/ace-train\n@@scanned 14\n")
+        trainer = self.click(remote)
+        self.assertEqual(trainer["state"], "failed")
+        self.assertIn("libgomp.so.1 (needed by /root/beat_tool/trainer-5ae17a66/ace-train)", trainer["error"])
+
+    def test_a_check_that_ends_early_is_not_a_pass(self):
+        remote = FakeTrainerRemote(found=TRAINER_RECORD, running="none", libraries="Connection reset\n")
+        trainer = self.click(remote)
+        self.assertEqual(trainer["state"], "failed")
+        self.assertIn("Checking the libraries on the rented machine ended early", trainer["error"])
 
     def test_a_trainer_for_another_card_is_built_again(self):
         remote = FakeTrainerRemote(found={**TRAINER_RECORD, "architectures": "89"},
@@ -523,6 +567,7 @@ class TrainerTest(unittest.TestCase):
             "launch": beat_remote.launch_script("/root/s", "/root/s/log", trainer=folder + "/ace-train"),
             "gpu": beat_remote.GPU_SCRIPT,
             "compute": beat_remote.compute_script(),
+            "libraries": beat_remote.libraries_script(["/root/beat_tool/s", folder]),
             "studio": beat_remote.studio_script(beat_tool.LINUX_URL, beat_tool.LINUX_ASSET, beat_tool.LINUX_BYTES,
                                                 beat_tool.LINUX_SHA256, "/root/beat_tool/s", beat_tool.MARKER),
         }
@@ -786,7 +831,38 @@ class CudaTest(unittest.TestCase):
                                "@@vulkan-end 0"])
         self.assertEqual(cuda["state"], "failed")
         self.assertIn("Vulkan finds no NVIDIA card on the rented machine, only llvmpipe", cuda["error"])
-        self.assertIn("no NVIDIA Vulkan driver (libGLX_nvidia is not in its image). Stop renting it", cuda["error"])
+        self.assertIn("only the compute part of the NVIDIA driver, not its Vulkan part (libGLX_nvidia). Stop renting it",
+                      cuda["error"])
+
+    def test_the_drivers_vulkan_part_the_host_left_out_is_added(self):
+        # a rented RTX 4090 whose host mounted only the compute part of driver 595.91.07 (23 Nov 2026)
+        cuda = self.on_rented(["@@ The host gave this machine only the compute part of NVIDIA driver 595.91.07; adding its Vulkan part…",
+                               "@@nvgl libnvidia-gl 595.91.07 from NVIDIA's CUDA repository",
+                               "@@icd /usr/share/vulkan/icd.d/nvidia_icd.json", "@@glx 1", "@@glxmissing ", "@@egl 1",
+                               "@@json " + json.dumps(PROBE), "@@vulkan-begin", *VULKAN_CARD, "@@vulkan-end 0"])
+        self.assertEqual(cuda["state"], "ok", cuda["error"])
+        self.assertEqual(cuda["facts"]["Vulkan part of the driver"],
+                         "added by Beat Tool (libnvidia-gl 595.91.07 from NVIDIA's CUDA repository): the host had left it out")
+
+    def test_the_drivers_vulkan_part_that_cannot_be_added_says_why(self):
+        cuda = self.on_rented(["@@nvglfail neither NVIDIA's CUDA repository nor NVIDIA's download site has driver 595.91.07 "
+                               "(curl: (22) The requested URL returned error: 404)", "@@icd none", "@@glx 0",
+                               "@@json " + json.dumps(PROBE), "@@vulkan-begin", *VULKAN_SOFTWARE, "@@vulkan-end 0"])
+        self.assertEqual(cuda["state"], "failed")
+        self.assertIn("Beat Tool could not add it: neither NVIDIA's CUDA repository nor NVIDIA's download site has "
+                      "driver 595.91.07", cuda["error"])
+        self.assertIn("Stop renting it and rent another", cuda["error"])
+
+    def test_the_vulkan_part_is_taken_at_exactly_the_drivers_version(self):
+        script = beat_remote.compute_script()
+        self.assertIn("if ! have 'libGLX_nvidia.so.0'; then", script)
+        self.assertIn("nvidia-smi --query-gpu=driver_version", script)
+        self.assertIn('awk -F\'|\' -v v="$v-"', script)
+        self.assertIn("pick libnvidia-gl \"libnvidia-gl-${v%%.*}\"", script)
+        self.assertIn("https://download.nvidia.com/XFree86/Linux-x86_64/$v/$run", script)
+        # what the host mounted is never written over
+        self.assertIn('[ ! -e "/usr/lib/x86_64-linux-gnu/$lib.so.$v" ]', script)
+        self.assertLess(script.index("libGLX_nvidia.so.0'; then\n  v="), script.index("@@icd "))
 
     def test_a_driver_that_lacks_libegl_is_not_the_machines_fault(self):
         # driver 615 opens libEGL.so.1 before it starts Vulkan and refuses without it (rented RTX 4090, 23 Nov 2026)
@@ -1065,6 +1141,39 @@ class PartsTest(unittest.TestCase):
         self.assertIn("does not count the LoRA trainer installed", parts["error"])
         self.assertNotIn("training", studio.asked)
 
+    def on_rented(self, libraries):
+        self.app.mode = "vast"
+        self.app.remote_folder = "/root/beat_tool/studio"
+        for step in beat_tool.SETUP_VAST[:beat_tool.SETUP_VAST.index("parts")]:
+            self.app.steps[step]["state"] = "ok"
+        remote = FakeTrainerRemote(libraries=libraries)
+        self.app.remote = remote
+        return remote, self.click(PartsStudio(ready={"separator", "training", "midi", "listen"}))
+
+    def test_on_a_rented_machine_what_the_studio_links_is_there_before_open(self):
+        remote, parts = self.on_rented("@@installed libasound2\n"
+                                       "@@missing libdc1394.so.25 /root/beat_tool/studio/usr/lib/gstreamer-1.0/libgstdc1394.so\n"
+                                       "@@scanned 664\n")
+        self.assertEqual(parts["state"], "ok", parts["error"])
+        self.assertEqual(remote.calls, ["libraries"])
+        self.assertIn("/root/beat_tool/studio", remote.libraries_script)
+        self.assertIn(beat_remote.trainer_folder(beat_tool.TRAINER_COMMIT), remote.libraries_script)
+        self.assertEqual(parts["facts"]["System libraries"], "all there; installed now: libasound2")
+        self.assertIn("libdc1394.so.25 (needed by /root/beat_tool/studio/usr/lib/gstreamer-1.0/libgstdc1394.so)",
+                      parts["facts"]["Not needed, missing"])
+
+    def test_on_a_rented_machine_a_studio_program_missing_a_library_is_red(self):
+        _, parts = self.on_rented("@@missing libweird.so.3 /root/beat_tool/studio/runtimes/engine/yue-server\n@@scanned 664\n")
+        self.assertEqual(parts["state"], "failed")
+        self.assertIn("libweird.so.3 (needed by /root/beat_tool/studio/runtimes/engine/yue-server)", parts["error"])
+        self.assertFalse(self.app.snapshot()["can"]["open"])
+
+    def test_the_first_step_installs_what_the_studio_and_trainer_link(self):
+        script = beat_remote.compute_script()
+        for library, package in beat_remote.MACHINE_PACKAGES.items():
+            self.assertIn(f'have {library} || need="$need {package}"', script)
+        self.assertEqual(beat_remote.MACHINE_PACKAGES["libgomp.so.1"], "libgomp1")
+
 
 # ------------------------------------------------------------ Open YuE2 Studio: the last check
 
@@ -1136,6 +1245,250 @@ class OpenTest(unittest.TestCase):
             self.app.open_click()
         self.assertEqual(self.app.steps["start"]["state"], "failed")
         self.assertEqual(self.app.steps["models"]["state"], "open")
+
+
+# ------------------------------------------------------------ a LoRA dataset folder, sent with its styles
+
+STYLE = ("A contemporary R&B song with a chill, late-night mood: a smooth, intimate lead vocal sings regretful, heartfelt "
+         "lyrics about losing someone over a relaxed groove, with soft, atmospheric, spacious production and a laid-back, "
+         "moody feel from start to finish, 84 BPM.")
+
+
+def write_wav(path, seconds, rate=48000, float32=True):
+    """A silent WAV of a length, float (format 3, as FL Studio renders) or 16-bit PCM."""
+    channels, bits = 2, 32 if float32 else 16
+    data = bytes(int(seconds * rate) * channels * bits // 8)
+    fmt = struct.pack("<HHIIHH", 3 if float32 else 1, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits)
+    Path(path).write_bytes(b"RIFF" + struct.pack("<I", 4 + 8 + len(fmt) + 8 + len(data)) + b"WAVE" +
+                           b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(data)) + data)
+
+
+class DatasetFolderTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.temp.name) / "dataset_date231126time0815"
+        self.folder.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def song(self, stem, text, seconds=20.0):
+        write_wav(self.folder / f"{stem}.wav", seconds)
+        if text is not None:
+            (self.folder / f"{stem}.txt").write_text(text, encoding="utf-8")
+
+    def test_the_txt_as_you_wrote_it(self):
+        lyrics, style = beat_tool.split_style("I can never find the time\r\nThe silence talking\r\n\r\nstyle:\r\n\r\n"
+                                              "contemporary rnb late night chill\r\n")
+        self.assertEqual((lyrics, style), ("I can never find the time\nThe silence talking", "contemporary rnb late night chill"))
+        self.assertEqual(beat_tool.split_style("[Chorus]\nla la\nStyle: slow soul, 70 BPM"), ("[Chorus]\nla la", "slow soul, 70 BPM"))
+        self.assertEqual(beat_tool.split_style("[Verse 1]\nno style here"), ("[Verse 1]\nno style here", ""))
+
+    def test_section_tags_as_the_studio_keeps_them(self):
+        self.assertEqual(beat_tool.section_tags("[Verse 1]\nwords\n[Chorus: hook]\n[00:12.30]\n [Chorus] \nmore"),
+                         ["[Verse 1]", "[Chorus]"])
+
+    def test_wav_length_from_its_header(self):
+        write_wav(self.folder / "f.wav", 12.5)
+        write_wav(self.folder / "p.wav", 3.0, rate=44100, float32=False)
+        self.assertAlmostEqual(beat_tool.wav_seconds(self.folder / "f.wav"), 12.5, places=3)
+        self.assertAlmostEqual(beat_tool.wav_seconds(self.folder / "p.wav"), 3.0, places=3)
+        (self.folder / "x.mp3").write_bytes(b"ID3\x04")
+        self.assertIsNone(beat_tool.wav_seconds(self.folder / "x.mp3"))
+
+    def test_a_folder_ready_to_send(self):
+        for stem in "12345":
+            self.song(stem, f"[Verse 1]\nline of {stem}\n\nstyle:\n\n{STYLE}\n")
+        read = beat_tool.read_dataset_folder(self.folder)
+        self.assertEqual((read["problems"], read["warnings"]), (0, []))
+        self.assertEqual(read["name"], "dataset_date231126time0815")
+        self.assertEqual(read["songs"][0]["lyrics"], "[Verse 1]\nline of 1")
+        self.assertEqual((read["songs"][0]["style"], read["songs"][0]["style_from"]), (STYLE, "its .txt"))
+
+    def test_one_style_txt_for_every_song_and_a_songs_own_style_first(self):
+        for stem in "1234":
+            self.song(stem, f"[Chorus]\nline {stem}\n")
+        self.song("5", "[Chorus]\nline 5\nstyle: its own style, slow and warm, 70 BPM\n")
+        (self.folder / "style.txt").write_text(STYLE + "\n", encoding="utf-8")
+        read = beat_tool.read_dataset_folder(self.folder)
+        self.assertEqual(read["problems"], 0)
+        self.assertEqual([song["style_from"] for song in read["songs"]], ["style.txt"] * 4 + ["its .txt"])
+        self.assertEqual(read["songs"][0]["style"], STYLE)
+        self.assertIn("the style has 8 words", read["songs"][4]["warnings"][0])
+
+    def test_what_stands_in_the_way_is_named_under_its_song(self):
+        self.song("1", "[Verse 1]\nok\nstyle: " + STYLE)
+        self.song("2", "just words, no sections\nstyle: " + STYLE)
+        self.song("3", None)
+        self.song("4", "[Chorus]\nshort one\nstyle: " + STYLE, seconds=6.5)
+        self.song("5", "[Chorus]\nno style\n")
+        (self.folder / "6.txt").write_text("[Verse 1]\nan orphan", encoding="utf-8")
+        read = beat_tool.read_dataset_folder(self.folder)
+        problems = {song["file"]: " ".join(song["problems"]) for song in read["songs"]}
+        self.assertEqual(problems["1.wav"], "")
+        self.assertIn("no section tags in 2.txt", problems["2.wav"])
+        self.assertIn("no 3.txt beside it", problems["3.wav"])
+        self.assertIn("6.5 s long: the studio refuses a song under 10 s", problems["4.wav"])
+        self.assertIn("no style", problems["5.wav"])
+        self.assertIn("6.txt has no audio file of the same name", read["warnings"][0])
+        self.assertEqual(read["problems"], 5)
+
+    def test_the_newest_dataset_folder_on_the_desktop(self):
+        desktop = Path(self.temp.name)
+        self.song("1", "[Verse 1]\nx")
+        (desktop / "dataset_empty").mkdir()
+        (desktop / "notes").mkdir()
+        self.assertEqual(beat_tool.newest_dataset_folder(desktop), str(self.folder))
+
+
+class DatasetStudio:
+    """YuE2 Studio's training datasets as Beat Tool's dataset card uses them: adding a folder reads it as an upload
+    does (lyrics from each .txt, every style empty); files_at answers what lies at a path on the studio's computer."""
+
+    def __init__(self, files_at=None, existing=None, add_fails=False):
+        self.datasets, self.calls, self.add_fails, self.last = {}, [], add_fails, None
+        self.files_at = files_at or (lambda path: {p.name: p.read_bytes() for p in Path(path).iterdir()})
+        for name, items in (existing or {}).items():
+            self.datasets["old-" + name] = {"id": "old-" + name, "name": name, "items": items}
+
+    def call(self, name, arguments=None, timeout=None, text_ok=False):
+        self.last, arguments = name, arguments or {}
+        self.calls.append((name, dict(arguments)))
+        if name == "training_status":
+            return {"datasets": [{"id": d["id"], "name": d["name"]} for d in self.datasets.values()]}
+        if name == "dataset_create":
+            self.datasets["ds1"] = {"id": "ds1", "name": arguments["name"], "items": []}
+            return {"id": "ds1", "name": arguments["name"], "items": []}
+        if name == "dataset_add_folder":
+            if self.add_fails:
+                raise StudioError("dataset_add_folder: 1.wav: the song is too short")
+            files = self.files_at(arguments["path"])
+            for file in sorted(f for f in files if f.endswith(".wav")):
+                stem = file[:-4]
+                lyrics = files.get(stem + ".txt", b"").decode()
+                self.datasets[arguments["dataset_id"]]["items"].append({
+                    "id": "song-" + stem, "title": stem, "source": "file:" + file, "lyrics": lyrics.strip(), "style": "",
+                    "lyrics_state": "done" if beat_tool.section_tags(lyrics) else "found", "style_state": "wanted"})
+            return self.datasets[arguments["dataset_id"]]
+        if name == "dataset_get":
+            return self.datasets[arguments["dataset_id"]]
+        if name == "dataset_song_update":
+            item = next(i for i in self.datasets[arguments["dataset_id"]]["items"] if i["id"] == arguments["song_id"])
+            item["style"], item["style_state"] = arguments["style"], "done" if arguments["style"].strip() else "wanted"
+            return self.datasets[arguments["dataset_id"]]
+        if name == "dataset_delete":
+            del self.datasets[arguments["dataset_id"]]
+            return {"deleted": True}
+        raise AssertionError(f"the dataset card called {name}")
+
+
+class DatasetSendTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name)
+        self.folder = self.home / "Desktop" / "dataset_date231126time0815"
+        self.folder.mkdir(parents=True)
+        for stem, tag in zip("12345", ["[Verse 1]", "[Chorus]", "[Chorus]", "[Verse 2]", "[Chorus]"]):
+            write_wav(self.folder / f"{stem}.wav", 12 + int(stem))
+            (self.folder / f"{stem}.txt").write_text(f"{tag}\nwords of {stem}\n\nstyle:\n\n{STYLE}\n", encoding="utf-8")
+        self.app = App(folder=self.home / "beattool")
+        self.app.steps["start"]["state"] = "ok"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def click(self, studio, what="send"):
+        self.app.studio = studio
+        self.app.dataset_click({"do": what, "folder": str(self.folder)}).join(10)
+        self.assertIsNone(self.app.busy)
+        return self.app.snapshot()["dataset"]
+
+    def test_sent_with_every_style_and_the_studio_counts_all_ready(self):
+        studio = DatasetStudio()
+        card = self.click(studio)
+        self.assertEqual(card["state"], "ok", card["error"])
+        self.assertEqual(card["facts"]["Ready"], "5 of 5 songs (YuE2 Studio's own count)")
+        self.assertEqual(card["facts"]["Styles written now"], "5")
+        items = studio.datasets["ds1"]["items"]
+        self.assertTrue(all(item["style"] == STYLE for item in items))
+        self.assertTrue(all("style" not in item["lyrics"] for item in items))         # the style lines stayed home
+        staged = self.app.folder / "datasets" / "dataset_date231126time0815"
+        self.assertEqual(sorted(p.name for p in staged.iterdir()), sorted(p.name for p in self.folder.iterdir()))
+        self.assertEqual((staged / "1.txt").read_text(encoding="utf-8"), "[Verse 1]\nwords of 1\n")
+        self.assertIn("words of 1\n\nstyle:", (self.folder / "1.txt").read_text(encoding="utf-8"))   # yours untouched
+        add = next(arguments for name, arguments in studio.calls if name == "dataset_add_folder")
+        self.assertEqual(add["path"], str(staged))
+
+    def test_a_dataset_of_that_name_already_in_the_studio_is_not_sent_twice(self):
+        card = self.click(DatasetStudio(existing={"dataset_date231126time0815": []}))
+        self.assertEqual(card["state"], "failed")
+        self.assertIn("already has a dataset named dataset_date231126time0815", card["error"])
+        self.assertIn("Set the styles in the studio", card["error"])
+
+    def test_a_failed_add_takes_the_half_made_dataset_out_again(self):
+        studio = DatasetStudio(add_fails=True)
+        card = self.click(studio)
+        self.assertEqual(card["state"], "failed")
+        self.assertIn("the song is too short", card["error"])
+        self.assertIn("taken out of the studio again", card["error"])
+        self.assertEqual(studio.datasets, {})
+
+    def test_the_styles_given_to_a_dataset_you_uploaded_yourself(self):
+        uploaded = [{"id": f"u{stem}", "title": f"Song {stem}", "source": f"file:dataset_date231126time0815/{stem}.wav",
+                     "lyrics": "[Chorus]\nx", "style": "", "lyrics_state": "done", "style_state": "wanted"} for stem in "12345"]
+        uploaded.append({"id": "u9", "title": "extra", "source": "file:9.wav", "lyrics": "[Chorus]\ny", "style": "slow",
+                         "lyrics_state": "done", "style_state": "done"})
+        studio = DatasetStudio(existing={"dataset_date231126time0815": uploaded})
+        card = self.click(studio, "styles")
+        self.assertEqual(card["state"], "ok", card["error"])
+        self.assertTrue(all(item["style"] == STYLE for item in uploaded[:5]))
+        self.assertEqual(uploaded[5]["style"], "slow")
+        self.assertEqual(card["facts"]["Ready"], "6 of 6 songs (YuE2 Studio's own count)")
+        self.assertIn("extra (not in the folder: left as they are)", card["facts"]["Also in the dataset"])
+        self.assertIn("F5", card["note"])
+        self.assertNotIn("dataset_create", [name for name, _ in studio.calls])
+
+    def test_on_a_rented_machine_the_copy_goes_there_first(self):
+        sent = {}
+
+        class Shell:
+            def __str__(self):
+                return "root@203.0.113.7:40000"
+
+            def sh(self, script, timeout=120):
+                self.script = script
+                return ""
+
+            def put(self, local, path, digest, timeout=3600):
+                self.assert_digest = (hashlib.sha256(Path(local).read_bytes()).hexdigest() == digest)
+                sent[path] = Path(local).read_bytes()
+                return True
+        self.app.mode, self.app.remote = "vast", Shell()
+        there = "/root/beat_tool/datasets/dataset_date231126time0815"
+        studio = DatasetStudio(files_at=lambda path: {k.rsplit("/", 1)[1]: v for k, v in sent.items() if k.startswith(path + "/")})
+        card = self.click(studio)
+        self.assertEqual(card["state"], "ok", card["error"])
+        self.assertEqual(sorted(sent), sorted(f"{there}/{name}" for name in [f"{s}.{e}" for s in "12345" for e in ("txt", "wav")]))
+        self.assertTrue(self.app.remote.assert_digest)
+        self.assertEqual(self.app.remote.script, f"rm -rf {there}")
+        self.assertEqual(next(a for n, a in studio.calls if n == "dataset_add_folder")["path"], there)
+
+    def test_problems_in_the_folder_stop_it_before_anything_is_sent(self):
+        (self.folder / "2.txt").write_text("no sections\nstyle: " + STYLE, encoding="utf-8")
+        studio = DatasetStudio()
+        card = self.click(studio)
+        self.assertEqual(card["state"], "failed")
+        self.assertIn("1 thing to fix in the folder first", card["error"])
+        self.assertEqual(studio.calls, [])
+
+    def test_check_needs_no_studio_and_send_waits_for_it(self):
+        self.app.steps["start"]["state"] = "open"
+        with self.assertRaisesRegex(beat_tool.Refused, "First get YuE2 Studio running"):
+            self.app.dataset_click({"do": "send", "folder": str(self.folder)})
+        card = self.click(DatasetStudio(), "check")
+        self.assertEqual(card["state"], "ok", card["error"])
+        self.assertEqual(len(card["data"]["songs"]), 5)
+        self.assertFalse(card["can_send"])
 
 
 if __name__ == "__main__":
