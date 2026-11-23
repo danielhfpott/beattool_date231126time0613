@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beat Tool</title>
+<style>
+:root {
+  --bg: #f4f3ef; --card: #ffffff; --ink: #1e262a; --quiet: #5b666b; --line: #d8d5cd;
+  --ok: #2b7a4b; --ok-bg: #e2f1e7; --bad: #b02626; --bad-bg: #fbe8e6; --work: #8a5800; --work-bg: #fcf0d6;
+  --accent: #2a5b8c; --field: #fbfaf7;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15181a; --card: #1e2326; --ink: #e6e9ea; --quiet: #9aa4a9; --line: #343b3f;
+    --ok: #62c28a; --ok-bg: #1c3125; --bad: #f2796d; --bad-bg: #3a1e1b; --work: #e6b44c; --work-bg: #342a15;
+    --accent: #82b2e2; --field: #181c1e;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15181a; --card: #1e2326; --ink: #e6e9ea; --quiet: #9aa4a9; --line: #343b3f;
+  --ok: #62c28a; --ok-bg: #1c3125; --bad: #f2796d; --bad-bg: #3a1e1b; --work: #e6b44c; --work-bg: #342a15;
+  --accent: #82b2e2; --field: #181c1e;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 "Segoe UI", system-ui, sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line); padding: 10px 16px; }
+header h1 { font-size: 17px; margin: 0; }
+header .top { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: space-between; margin: 0 0 6px; }
+header .top .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+header .top button { padding: 4px 14px; font-size: 14px; }
+#status { margin: 4px 0 0; color: var(--work); font-size: 13px; }
+#status:empty { display: none; }
+#studio-link { margin: 6px 0 0; color: var(--quiet); font-size: 13px; overflow-wrap: anywhere; }
+#studio-link:empty { display: none; }
+#studio-link a { color: var(--accent); }
+.chain { display: flex; flex-wrap: wrap; align-items: center; row-gap: 6px; margin: 4px 0; }
+.chip { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); font-size: 13px; white-space: nowrap; cursor: pointer; }
+.chip.ok { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+.chip.failed { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); }
+.chip.working { background: var(--work-bg); border-color: var(--work); color: var(--work); }
+.link { width: 20px; height: 2px; background: var(--line); }
+.link.on { background: var(--ok); }
+#message { margin: 6px 0 0; color: var(--bad); font-size: 14px; white-space: pre-wrap; }
+#message:empty { display: none; }
+main { max-width: 880px; margin: 0 auto; padding: 8px 16px 40px; }
+.section { font-size: 12px; color: var(--quiet); text-transform: uppercase; letter-spacing: .05em; margin: 22px 0 4px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 10px 0; }
+.card.ok { border-color: var(--ok); }
+.card.failed { border-color: var(--bad); }
+.card.working { border-color: var(--work); }
+.card h2 { font-size: 16px; margin: 0 0 4px; display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.card h2 .num { color: var(--quiet); font-weight: 400; }
+.badge { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--bg); color: var(--quiet); }
+.ok .badge { background: var(--ok-bg); color: var(--ok); }
+.failed .badge { background: var(--bad-bg); color: var(--bad); }
+.working .badge { background: var(--work-bg); color: var(--work); }
+.what { color: var(--quiet); margin: 0 0 8px; }
+dl.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 14px; margin: 8px 0 0; font-size: 14px; }
+dl.facts:empty { display: none; }
+dl.facts dt { color: var(--quiet); }
+dl.facts dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.note { color: var(--work); margin: 8px 0 0; }
+.note:empty, .error:empty, .extra:empty { display: none; }
+.error { background: var(--bad-bg); color: var(--bad); border-radius: 6px; padding: 8px 10px; margin: 8px 0 0;
+         font: 13px/1.45 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.extra { margin: 8px 0 0; font-size: 14px; }
+.extra code { font: 13px Consolas, "Cascadia Mono", monospace; overflow-wrap: anywhere; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+button { font: inherit; font-size: 14px; padding: 6px 14px; border-radius: 7px; border: 1px solid var(--accent);
+         background: var(--accent); color: var(--card); cursor: pointer; }
+button.plain { background: transparent; color: var(--accent); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+input, select { font: inherit; font-size: 14px; color: var(--ink); background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; max-width: 100%; }
+.list { display: grid; gap: 6px; margin: 8px 0 0; }
+.option { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.option > div { min-width: 0; flex: 1; }
+.option small { color: var(--quiet); display: block; overflow-wrap: anywhere; }
+.option.ready { border-color: var(--ok); }
+details { margin-top: 8px; font-size: 13px; }
+details pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px Consolas, monospace; color: var(--quiet); }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>Beat Tool · YuE2 Studio, prepared and checked before you open it</h1>
+    <div class="actions">
+      <button id="prepare" title="Runs every step after Where it runs that is not verified yet, in order, until only Open YuE2 Studio is left">Prepare everything</button>
+      <button class="plain" id="studio-open" title="Only once every step before it is verified">Open YuE2 Studio ↗</button>
+    </div>
+  </div>
+  <div class="chain" id="chain"></div>
+  <div id="status"></div>
+  <div id="studio-link"></div>
+  <div id="message"></div>
+</header>
+<main>
+  <div class="section">Setup · everything is checked before the studio opens</div>
+  <div id="cards"></div>
+</main>
+<script>
+"use strict";
+const WHAT = {
+  where: "Where the computing runs: on this PC's graphics card, or on a machine you rent on vast.ai with your own API key. Find machines lists only machines with one RTX 4090 or RTX 5090, more than 99.5% reliable, with at least 500 Mbps down and up, cheapest first. A rented machine bills until you click Stop renting.",
+  gpu: "nvidia-smi names the graphics card, its memory and its driver.",
+  cuda: "CUDA tested by using it, before anything of the studio is downloaded: the driver starts CUDA, and the card takes 256 MB of its memory, fills it and gives it back.",
+  studio: "The pinned YuE2 Studio portable zip from GitHub: downloaded, checked against its SHA-256, and unpacked into this folder.",
+  trainer: "",
+  start: "Starts YuE2 Studio and waits until its MCP server answers, so the steps after it can prepare it (on this PC the studio's own window appears). A studio already running is used, never started a second time; it must be the pinned version, keeping its data in the folder unpacked here.",
+  models: "The model sets the studio offers, with what each downloads. The studio's own pick for this card is preselected when it carries SheetSage2 (which reads a recording into a score); otherwise the smallest set that does. Nothing downloads until you click.",
+  engine: "The studio's own engine computing on the card: its backend is set to cuda (on “auto” it could fall back to the processor; this step sets it when it is not, and restarts the engine), and its own log must name the CUDA device. No song is made.",
+  parts: "Everything the studio would otherwise download the first time you use it, downloaded now, one after another, and checked ready: the stem separator, the training pack for LoRAs, Audio to MIDI and the listening pack.",
+  open: "The last check, then the studio: the version, the model set, the engine on the card, the LoRA trainer and every part are asked again of the studio as it runs now, and its window opens in a tab here. A problem found turns its step red, and Prepare everything sets it right. From there you work in YuE2 Studio yourself.",
+};
+// What a step does when the work runs on a rented machine; the other steps read the same.
+const WHAT_REMOTE = {
+  gpu: "nvidia-smi on the rented machine names its card, memory and driver, and the machine is checked for a driver of 580 or newer, the CUDA 13 libraries, and about 70 GB of disk for everything that follows.",
+  cuda: "CUDA and Vulkan tested by using them, before anything of the studio is downloaded onto the rented machine: the driver starts CUDA and the card takes 256 MB, fills it and gives it back; the CUDA 13 libraries the studio's tools load are loaded; and Vulkan, which the studio's song engine computes through there, must find the NVIDIA card, not only the processor. A machine that fails here is one to stop renting.",
+  studio: "The studio's Linux build (the pinned AppImage) is downloaded straight onto the rented machine, checked there against its SHA-256 and unpacked, with its data in its own folder. Nothing of it passes this PC.",
+  trainer: "The studio's Linux build has no LoRA trainer of its own, and it must be started with one, or its LoRA page cannot train. So the trainer comes before the studio starts: Beat Tool builds HOT-Step's ace-train (the commit this studio pins) for the rented card, about a quarter of an hour once per kind of card, and keeps a checked copy here, so the next machine with that kind of card gets it in a minute.",
+  start: "Starts the studio on the rented machine in the background (under a virtual display) with the LoRA trainer, and waits until its MCP answers through an SSH tunnel. A studio already running is used, never started a second time, unless it runs without the trainer: then it is stopped and started again with it. You open it in the last step.",
+  models: "The model sets the studio offers, with what each downloads onto the rented machine (every rented machine starts empty). The studio's own pick for this card is preselected when it carries SheetSage2 (which reads a recording into a score); otherwise the smallest set that does. Nothing downloads until you click.",
+  engine: "The studio's own engine computing on the rented NVIDIA card: its backend is set to vulkan (the studio ships its CUDA song engine for Windows only, so there it computes through Vulkan on the same card; this step sets it when it is not, and restarts the engine), and its own log must name the card. Score, stems and MIDI use CUDA. No song is made.",
+};
+let S = null;
+let built = {};
+const sigs = {};
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const size = n => (n >= 1e9 ? (n / 1e9).toFixed(2) + " GB" : (n / 1e6).toFixed(1) + " MB");
+const post = (action, body) => fetch("/api/" + action, { method: "POST", headers: { "Content-Type": "application/json", "X-Beat-Tool": "1" }, body: JSON.stringify(body || {}) });
+
+function message(text) { $("#message").textContent = text || ""; }
+
+async function act(action, body) {
+  message("");
+  try {
+    const r = await post(action, body);
+    const data = await r.json().catch(() => ({ error: r.status + " " + r.statusText }));
+    if (!r.ok) message(data.error);
+  } catch (e) { message("The Beat Tool backend does not answer: " + e.message + ". Is its window still open?"); }
+  refresh();
+}
+
+// The model set picked on the Models card, if one is: Prepare everything uses it, else the one preselected.
+function pickedProfile() { const v = $("input[name=profile]:checked"); return v ? v.value : null; }
+
+$("#prepare").onclick = () => act("prepare", { profile_id: pickedProfile() });
+
+// The Studio running card answers every click on its own card: at once while the backend is asked, and in red when the
+// click did not reach the backend or was refused, until the next click (or, when the backend was gone, until it answers).
+let startClick = null;
+
+function startView() {
+  const st = S.steps.start;
+  if (startClick && startClick.was !== undefined && startClick.was !== st.state) startClick = null;
+  if (startClick) return { ...st, ...startClick };
+  return { ...st, badge: st.state === "ok" ? "connected" : st.state === "working" ? (st.data || {}).phase : "" };
+}
+
+async function startStudio() {
+  message("");
+  startClick = { state: "working", badge: "starting…", note: "Sending the click to the Beat Tool backend…", error: "", facts: {}, can: false };
+  render();
+  try {
+    const r = await post("start");
+    const data = await r.json().catch(() => ({ error: r.status + " " + r.statusText }));
+    startClick = r.ok ? null : { state: "failed", badge: "failed", note: "", was: S.steps.start.state,
+      error: "The Beat Tool backend did not take the click (HTTP " + r.status + "): " + data.error };
+  } catch (e) {
+    startClick = { state: "failed", badge: "failed", note: "", facts: {}, gone: true,
+      error: "The click did not reach the Beat Tool backend: nothing answers at " + location.origin + " (" + e.message + "), so YuE2 Studio was not started.\n" +
+        "Start the backend again with “RUN ME - Beat Tool.cmd”; this page picks it up by itself. The backend writes no log file: what it said last is in its own window, if that is still open." };
+  }
+  render();
+  refresh();
+}
+
+// Open YuE2 Studio, the last step: the backend checks everything again and answers where the studio's window answers
+// (on this PC, or on the rented machine through the SSH tunnel Beat Tool holds). The tab opens inside the click, so no
+// popup blocker stops it; it closes again when the check finds a problem.
+function studioLink(html) { $("#studio-link").innerHTML = html || ""; }
+
+async function openStudio() {
+  message("");
+  const tab = window.open("about:blank", "_blank");
+  studioLink("Checking everything once more before YuE2 Studio opens…");
+  try {
+    const r = await post("open");
+    const data = await r.json().catch(() => ({ error: r.status + " " + r.statusText }));
+    if (!r.ok) { if (tab) tab.close(); studioLink(""); message(data.error); refresh(); return; }
+    if (tab) tab.location.href = data.url;
+    const where = S && S.mode === "vast" ? "on the rented machine, through Beat Tool's SSH tunnel" : "on this PC";
+    studioLink("YuE2 Studio " + where + ": <a href=\"" + esc(data.url) + "\" target=\"_blank\">" + esc(data.url) + "</a>" +
+      (tab ? " (opened in a new tab)" : " (your browser blocked the new tab: click the address)") +
+      ". If the tunnel reconnects, the address changes: click Open YuE2 Studio again.");
+  } catch (e) {
+    if (tab) tab.close();
+    studioLink("");
+    message("The Beat Tool backend does not answer: " + e.message + ". Is its window still open?");
+  }
+  refresh();
+}
+
+$("#studio-open").onclick = openStudio;
+
+function button(text, onclick, plain) {
+  const b = document.createElement("button");
+  b.textContent = text; b.onclick = onclick;
+  if (plain) b.className = "plain";
+  return b;
+}
+
+function chain() {
+  const html = [];
+  S.order.forEach((name, i) => {
+    if (i) html.push('<span class="link' + (S.steps[S.order[i - 1]].state === "ok" ? " on" : "") + '"></span>');
+    html.push('<span class="chip ' + S.steps[name].state + '" data-step="' + name + '">' + esc(S.labels[name]) + "</span>");
+  });
+  $("#chain").innerHTML = html.join("");
+  document.querySelectorAll(".chip").forEach(c => c.onclick = () => $("#card-" + c.dataset.step).scrollIntoView({ behavior: "smooth", block: "center" }));
+}
+
+function card(name, number) {
+  const el = document.createElement("section");
+  el.className = "card"; el.id = "card-" + name;
+  el.innerHTML = '<h2><span class="num">' + number + "</span><span></span>" + '<span class="badge"></span></h2>' +
+    '<p class="what"></p><div class="extra"></div><dl class="facts"></dl><p class="note"></p><div class="error"></div><div class="controls"></div>';
+  return el;
+}
+
+const BADGE = { open: "not connected", working: "working…", ok: "verified", failed: "failed" };
+
+function common(name) {
+  const st = name === "start" ? startView() : S.steps[name], el = $("#card-" + name);
+  el.className = "card " + st.state;
+  $("h2 span:nth-child(2)", el).textContent = S.labels[name];
+  $(".what", el).textContent = (S.mode === "vast" && WHAT_REMOTE[name]) || WHAT[name];
+  $(".badge", el).textContent = st.badge || (name === "open" && st.state === "ok" ? "opened" : BADGE[st.state]);
+  $(".facts", el).innerHTML = Object.entries(st.facts || {}).map(([k, v]) => "<dt>" + esc(k) + "</dt><dd>" + esc(v) + "</dd>").join("");
+  $(".note", el).textContent = st.note || "";
+  $(".error", el).textContent = st.error || "";
+  el.querySelectorAll("[data-gate]").forEach(x => x.disabled = !(st.can ?? S.can[name]));
+  return el;
+}
+
+function once(name, make) {
+  if (!built[name]) { built[name] = true; make($(".controls", $("#card-" + name))); }
+}
+
+function changed(key, value) {
+  const sig = JSON.stringify(value);
+  if (sigs[key] === sig) return false;
+  sigs[key] = sig; return true;
+}
+
+function gated(b) { b.dataset.gate = "1"; return b; }
+
+const R = {
+  where() {
+    const el = $("#card-where"), data = S.steps.where.data || {}, inst = data.instance;
+    once("where", c => {
+      c.append(gated(button("Use this PC", () => act("where_pc"), true)));
+      const box = document.createElement("div");
+      box.className = "controls"; box.style.cssText = "flex-basis:100%; margin-top:4px";
+      const key = document.createElement("input");
+      key.type = "password"; key.id = "vast-key"; key.autocomplete = "off"; key.placeholder = "vast.ai API key"; key.style.width = "260px";
+      const connect = gated(button("Connect to the rented machine", () => act("vast_connect"))); connect.id = "vast-connect";
+      const stop = button("Stop renting", () => {
+        const now = (S.steps.where.data || {}).instance;
+        if (now && confirm("Stop renting instance " + now.id + "? vast.ai destroys the machine and everything on it (its studio, models and any file not yet brought home); billing for it stops.")) act("vast_stop");
+      }, true);
+      stop.id = "vast-stop";
+      box.append(key, gated(button("Save key", () => { const v = key.value; key.value = ""; act("vast_key", { key: v }); }, true)),
+        gated(button("Forget key", () => act("vast_forget"), true)),
+        gated(button("Find RTX 4090 / 5090 machines", () => act("vast_offers"), true)), connect, stop);
+      c.append(box);
+    });
+    const here = S.mode === "vast";
+    $("#vast-connect").hidden = !inst || (here && S.steps.where.state === "ok");
+    $("#vast-stop").hidden = !inst;
+    $("#vast-stop").disabled = !!data.stopping;
+    $("#vast-stop").textContent = data.stopping ? "Stopping…" : "Stop renting";
+    if (changed("where-extra", [data, S.can.where, S.mode, S.steps.where.state])) {
+      const parts = ["<p>Key: " + (data.key_saved
+        ? "saved, encrypted for this Windows account" + (data.credit != null ? " · vast.ai credit $" + Number(data.credit).toFixed(2) : "")
+        : "none saved: paste your vast.ai API key (cloud.vast.ai · Account · Keys), then Save key") + "</p>"];
+      if (data.message) parts.push("<p>" + esc(data.message) + "</p>");
+      if (inst) parts.push("<p><b>Rented: instance " + esc(inst.id) + "</b> · " + esc(inst.gpu || (inst.offer || {}).gpu || "") + " · $" +
+        Number(inst.dph ?? (inst.offer || {}).dph ?? 0).toFixed(3) + "/h · since " + esc(inst.rented) + " · about <b id=\"vast-cost\"></b> so far. " +
+        "<b>It bills until you click Stop renting.</b></p>");
+      if (data.offers && data.offers.length) {
+        parts.push("<div>" + data.offers.length + " machines (of " + esc(data.offers_seen) + " offers vast.ai answered): one " +
+          esc((data.offers_rule || {}).gpus || "RTX 4090 or RTX 5090") + ", more than " + esc((data.offers_rule || {}).reliability ?? 99.5) +
+          "% reliable, at least " + esc((data.offers_rule || {}).mbps ?? 500) + " Mbps down and up, cheapest first:</div><div class=\"list\">" + data.offers.map(o =>
+          '<div class="option"><div><b>' + esc(o.gpu) + "</b> · " + esc(o.vram_gb) + " GB · $" + Number(o.dph).toFixed(3) + "/h<small>" +
+          esc([o.where, o.reliability + "% reliable", o.down_mbps + " Mbps down", o.up_mbps + " Mbps up", "driver " + o.driver, "CUDA " + o.cuda,
+            o.disk_gb + " GB disk", (o.cores ? Math.round(o.cores) : "?") + " cores · " + o.ram_gb + " GB RAM"].filter(Boolean).join(" · ")) + "</small></div>" +
+          '<button data-offer="' + esc(o.id) + '"' + (!S.can.where || inst ? " disabled" : "") + ">Rent this machine</button></div>").join("") + "</div>");
+      }
+      $(".extra", el).innerHTML = parts.join("");
+      el.querySelectorAll("[data-offer]").forEach(b => b.onclick = () => {
+        const o = data.offers.find(x => String(x.id) === b.dataset.offer);
+        if (o && confirm("Rent " + o.gpu + " (" + o.vram_gb + " GB) at $" + Number(o.dph).toFixed(3) + "/h? Billing starts now and continues until you click Stop renting.")) act("vast_rent", { offer: b.dataset.offer });
+      });
+    }
+    const cost = $("#vast-cost");
+    if (cost && inst) cost.textContent = "$" + (Math.max(0, Date.now() / 1000 - (inst.rented_epoch || Date.now() / 1000)) / 3600 * Number(inst.dph ?? (inst.offer || {}).dph ?? 0)).toFixed(2);
+  },
+  gpu() { once("gpu", c => c.append(gated(button("Check the GPU", () => act("gpu"))))); },
+  cuda() {
+    once("cuda", c => { const b = gated(button("", () => act("cuda"))); b.id = "cuda-go"; c.append(b); });
+    $("#cuda-go").textContent = S.mode === "vast" ? "Test CUDA and Vulkan" : "Test CUDA";
+  },
+  studio() {
+    const el = $("#card-studio");
+    once("studio", c => { const b = gated(button("", () => act("studio"))); b.id = "studio-go"; c.append(b); });
+    $("#studio-go").textContent = S.studio_found ? "Check " + S.studio_found
+      : S.mode === "vast" ? "Check, or download " + size(S.pin.bytes) + " onto the rented machine and unpack" : "Download " + size(S.pin.bytes) + " and unpack";
+    if (changed("studio-extra", [S.pin, S.studio_found, S.mode])) {
+      $(".extra", el).innerHTML = "Asset <code>" + esc(S.pin.asset) + "</code> · " + size(S.pin.bytes) + " (" + S.pin.bytes.toLocaleString() + " bytes) · release " + esc(S.pin.tag) +
+        "<br>From <code>" + esc(S.pin.url) + "</code><br>SHA-256 pin <code>" + esc(S.pin.sha256) + "</code><br>" +
+        (S.studio_found ? (S.mode === "vast" ? "Unpacked on the rented machine before: <code>" : "Unpacked here before: <code>") + esc(S.studio_found) + "</code>. A click checks it; nothing downloads."
+          : (S.mode === "vast" ? "Unpacks on the rented machine, in its own folder, as <code>" : "Unpacks into this folder as <code>") + esc(S.pin.folder) + "</code>; the studio keeps its models and library inside it.");
+    }
+  },
+  trainer() {
+    once("trainer", c => { const b = gated(button("", () => act("trainer"))); b.id = "trainer-go"; c.append(b); });
+    $("#trainer-go").textContent = S.steps.trainer.state === "ok" ? "Check the LoRA trainer again" : "Add the LoRA trainer";
+  },
+  start() { once("start", c => c.append(gated(button("Start YuE2 Studio", startStudio)))); },
+  models() {
+    const el = $("#card-models"), data = S.steps.models.data || {};
+    once("models", c => {
+      c.append(gated(button("Read the model sets", () => act("models_read"), true)));
+      const b = gated(button("", () => act("models_use", { profile_id: pickedProfile() })));
+      b.id = "models-go"; b.hidden = true; c.append(b);
+    });
+    if (changed("models-list", data)) {
+      const opts = data.options || [];
+      $(".extra", el).innerHTML = opts.length ? '<div class="list">' + opts.map(o =>
+        '<label class="option"><input type="radio" name="profile" value="' + esc(o.id) + '"' + (o.id === data.suggested ? " checked" : "") + '><div><b>' + esc(o.label) + "</b>" +
+        (o.id === data.suggested ? " · preselected" : "") + (o.recommended ? " · the studio's own pick for this card" : "") +
+        "<small>" + size(o.total_bytes) + " in all · " + (o.missing_bytes ? size(o.missing_bytes) + " still to download" : "all downloaded") +
+        " · SheetSage2 " + (o.transcriber ? "included" : "not included: cannot read a recording into a score") + "</small><details><summary>Files</summary><pre>" +
+        o.files.map(f => f.file + "  " + size(f.bytes) + "  " + f.kind + (f.installed ? "  (here)" : "")).map(esc).join("\n") + "</pre></details></div></label>").join("") + "</div>" +
+        (data.runtime_bytes && !data.runtime_ready ? "<p>The engine's first start also downloads NVIDIA's cuBLAS for CUDA: " + size(data.runtime_bytes) + ".</p>" : "") : "";
+      el.querySelectorAll("input[name=profile]").forEach(i => i.onchange = () => R.models());
+    }
+    const go = $("#models-go"), pick = $("input[name=profile]:checked", el);
+    const chosen = (data.options || []).find(o => pick && o.id === pick.value);
+    go.hidden = !chosen;
+    if (chosen) go.textContent = chosen.missing_bytes ? "Download " + size(chosen.missing_bytes) + " and use " + chosen.label : "Use " + chosen.label;
+  },
+  engine() { once("engine", c => c.append(gated(button("Check the engine", () => act("engine"))))); },
+  parts() {
+    const el = $("#card-parts"), data = S.steps.parts.data || {};
+    once("parts", c => {
+      c.append(gated(button("Read the parts", () => act("parts_read"), true)));
+      const b = gated(button("Download what is missing", () => act("parts"))); b.id = "parts-go"; c.append(b);
+    });
+    const left = (data.parts || []).filter(p => !p.ready && p.can !== false).reduce((n, p) => n + (p.missing_bytes || 0), 0);
+    $("#parts-go").textContent = data.parts ? (left ? "Download what is missing (" + size(left) + ")" : "Check the parts") : "Download what is missing";
+    if (changed("parts", data)) {
+      $(".extra", el).innerHTML = data.parts ? '<div class="list">' + data.parts.map(p =>
+        '<div class="option' + (p.ready ? " ready" : "") + '"><div><b>' + esc(p.label) + "</b> · " +
+        (p.ready ? "ready" : p.can === false ? "not on this card" + (p.why ? ": " + esc(p.why) : "") : size(p.missing_bytes) + " to download") +
+        "<small>" + esc(p.detail) + "</small></div></div>").join("") + "</div>" : "";
+    }
+  },
+  open() { once("open", c => c.append(gated(button("Open YuE2 Studio ↗", openStudio)))); },
+};
+
+function header() {
+  const between = S.order.slice(1, -1);
+  const prepared = between.every(n => S.steps[n].state === "ok");
+  const p = $("#prepare");
+  p.disabled = !!S.busy || !!S.preparing || S.steps.where.state !== "ok" || prepared;
+  p.textContent = S.preparing ? "Preparing…" : prepared ? "Everything is prepared" : "Prepare everything";
+  $("#studio-open").disabled = !S.can.open;
+  $("#status").textContent = S.preparing ? "Prepare everything: now " + (S.labels[S.preparing] || S.preparing) + "." +
+    " Each step shows what it does on its card; a step that fails stops it there." :
+    S.steps.where.state !== "ok" ? "Choose where it runs first (step 0): this PC, or a rented RTX 4090 / 5090." : "";
+}
+
+function render() {
+  if (changed("order", S.order)) {
+    built = {};
+    for (const key of Object.keys(sigs)) if (key !== "order") delete sigs[key];     // new cards draw everything again
+    const box = $("#cards"); box.innerHTML = "";
+    S.order.forEach((name, n) => box.append(card(name, n)));
+  }
+  chain();
+  header();
+  for (const name of S.order) { if (!R[name]) { location.reload(); return; } R[name](); common(name); }
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    S = await r.json();
+    if (startClick && startClick.gone) startClick = null;     // the backend answers again: its own state shows
+    render();
+  } catch (e) { message("The Beat Tool backend does not answer: " + e.message + ". Is its window still open?"); }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

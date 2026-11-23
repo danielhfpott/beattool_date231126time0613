@@ -1,0 +1,12 @@
+# Only Beat Tool's own code is tracked. These stay on this PC:
+# - vast/: this tool's SSH private key, the vast.ai API key (DPAPI), host keys, the tunnel log and the trainer cache
+vast/
+# - the unpacked YuE2 Studio with its models (gigabytes; someone else's release), and its download while it runs
+YuE2-Studio-*/
+studio/
+*.part
+YuE2-Studio-*.zip
+YuE2-Studio-*.AppImage
+# - your mixdowns, takes and stems
+beats/
+__pycache__/
